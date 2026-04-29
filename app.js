@@ -1,21 +1,23 @@
 // AIARE — main orchestrator
-// Wires DOM, sessions, engine, and renderer together.
+// Streams Claude's verbose thinking live, persists chat history, supports
+// file uploads (with auto-chunking) and a free-form "Ask agent" mode.
 
 import {
-  loadAll, persist, createSession, deleteSession, listSessions,
+  loadAll, persist, createSession, listSessions,
   activeSession, clearActiveSession, setActiveModel,
+  appendMessage, getActiveMessages,
 } from './js/storage.js';
 import {
-  EXAMPLE_LOG, reverseEngineer, mergeModel,
+  EXAMPLE_LOG, reverseEngineer, mergeModel, chatWithAgent,
 } from './js/engine.js';
 import { buildMermaid } from './js/mermaid-gen.js';
 import {
-  renderDiagram, showTooltip, hideTooltip, setZoom, currentSvg,
+  renderDiagram, showTooltip, hideTooltip, setZoom,
   downloadSvg, downloadPng, downloadText,
 } from './js/renderer.js';
+import { splitLogText, shouldChunk, chunkBanner } from './js/chunker.js';
 
 const $ = (id) => document.getElementById(id);
-
 const state = loadAll();
 
 // ------------------------------ DOM refs ------------------------------
@@ -35,13 +37,14 @@ const els = {
   zoomOut:       $('zoom-out'),
   canvasWrap:    $('canvas-wrap'),
   canvas:        $('mermaid-canvas'),
-  emptyMsg:      $('empty-msg'),
-  legend:        $('legend'),
 
   mergeBtn:      $('merge-btn'),
   chat:          $('chat'),
   logInput:      $('log-input'),
   submitLog:     $('submit-log'),
+  askBtn:        $('ask-btn'),
+  uploadBtn:     $('upload-btn'),
+  logFile:       $('log-file'),
   exampleBtn:    $('example-btn'),
 
   settingsModal: $('settings-modal'),
@@ -62,45 +65,115 @@ const els = {
   renameConfirm: $('rename-confirm'),
 };
 
+// inject .status style once
+(() => {
+  const s = document.createElement('style');
+  s.textContent = `
+    .msg .status { color: var(--accent); font-size: 11px; margin-bottom: 6px; font-family: ui-monospace, Menlo, monospace; }
+    .msg.error .status { color: var(--err); }
+  `;
+  document.head.appendChild(s);
+})();
+
 // ------------------------------ Chat ------------------------------
-function pushMsg({ role, label, body, thinking }) {
+function pushMsg({ role, label, body, thinking, status, persistMsg = true, meta }) {
   const div = document.createElement('div');
   div.className = `msg ${role}`;
   if (label) {
-    const l = document.createElement('div');
-    l.className = 'label';
-    l.textContent = label;
-    div.appendChild(l);
+    const l = document.createElement('div'); l.className = 'label'; l.textContent = label; div.appendChild(l);
+  }
+  if (status) {
+    const s = document.createElement('div'); s.className = 'status'; s.textContent = status; div.appendChild(s);
   }
   if (thinking) {
-    const t = document.createElement('div');
-    t.className = 'think';
-    t.textContent = thinking;
-    div.appendChild(t);
+    const t = document.createElement('div'); t.className = 'think'; t.textContent = thinking; div.appendChild(t);
   }
   if (body) {
-    const b = document.createElement('div');
-    b.className = 'summary';
-    b.textContent = body;
-    div.appendChild(b);
+    const b = document.createElement('div'); b.className = 'summary'; b.textContent = body; div.appendChild(b);
   }
   els.chat.appendChild(div);
   els.chat.scrollTop = els.chat.scrollHeight;
+  if (persistMsg) {
+    appendMessage(state, { role, label, text: body || '', thinking: thinking || '', status: status || '', meta });
+    persist(state);
+  }
   return div;
 }
-
-function pushSystem(text) { return pushMsg({ role: 'system', body: text }); }
+function pushSystem(text, opts = {}) { return pushMsg({ role: 'system', body: text, ...opts }); }
 function pushError(text)  { return pushMsg({ role: 'error', label: 'error', body: text }); }
+
+function makeAssistantBubble(label = 'thinking', cssRole = 'assistant') {
+  const div = document.createElement('div');
+  div.className = `msg ${cssRole}`;
+  div.innerHTML = `<div class="label"></div><div class="status"></div><div class="think"></div><div class="summary"></div>`;
+  div.querySelector('.label').textContent = label;
+  els.chat.appendChild(div);
+  els.chat.scrollTop = els.chat.scrollHeight;
+  let startedAt = Date.now();
+  let tick = null;
+  let stage = '';
+  const setStage = (text) => {
+    stage = text;
+    div.querySelector('.status').textContent = text;
+  };
+  const startTicking = () => {
+    if (tick) return;
+    tick = setInterval(() => {
+      if (!stage) return;
+      const sec = ((Date.now() - startedAt) / 1000).toFixed(1);
+      div.querySelector('.status').textContent = `${stage} · ${sec}s`;
+    }, 200);
+  };
+  const stopTicking = () => { if (tick) { clearInterval(tick); tick = null; } };
+  const appendThink = (text) => {
+    div.querySelector('.think').textContent += text;
+    els.chat.scrollTop = els.chat.scrollHeight;
+  };
+  const setSummary = (text) => { div.querySelector('.summary').textContent = text; };
+  const setError = (text) => {
+    div.classList.remove('assistant'); div.classList.remove('chat'); div.classList.add('error');
+    div.querySelector('.label').textContent = 'error';
+    stopTicking();
+    setStage('');
+    setSummary(text);
+  };
+  return { div, setStage, startTicking, stopTicking, appendThink, setSummary, setError };
+}
+
+const STAGE_LABELS = {
+  submitting:  '📤 Submitting log to Claude…',
+  awaiting:    '🌐 Awaiting first byte…',
+  parsing:     '🧩 Parsing inferred architecture JSON…',
+  validating:  '🔍 Validating nodes/edges…',
+  merging:     '🧮 Merging into existing model…',
+  persisting:  '💾 Saving session…',
+  done:        '✅ Done',
+};
 
 // ------------------------------ Sessions ------------------------------
 function refreshSessionSelect() {
-  const list = listSessions(state);
   els.sessionSelect.innerHTML = '';
-  for (const s of list) {
+  for (const s of listSessions(state)) {
     const opt = document.createElement('option');
     opt.value = s.id; opt.textContent = s.name;
     if (s.id === state.activeId) opt.selected = true;
     els.sessionSelect.appendChild(opt);
+  }
+}
+
+function rerenderChat() {
+  els.chat.innerHTML = '';
+  const messages = getActiveMessages(state);
+  for (const m of messages) {
+    pushMsg({
+      role: m.role || 'system',
+      label: m.label,
+      body: m.text,
+      thinking: m.thinking,
+      status: m.status,
+      persistMsg: false,
+      meta: m.meta,
+    });
   }
 }
 
@@ -110,26 +183,28 @@ function switchSession(id) {
   state.drillPath = [];
   persist(state);
   refreshSessionSelect();
-  els.chat.innerHTML = '';
-  pushSystem(`Switched to session "${state.sessions[id].name}".`);
-  if (state.sessions[id].logs.length === 0) promptForFirstLog();
+  rerenderChat();
+  if (activeSession(state).logs.length === 0 && getActiveMessages(state).length === 0) {
+    promptForFirstLog();
+  } else {
+    pushSystem(`Switched to "${activeSession(state).name}".`);
+  }
   rerender();
 }
 
 function promptForFirstLog() {
-  pushSystem('Paste your first log to begin. AIARE will reverse-engineer the architecture from it.');
+  pushSystem('Paste a log, upload a file (📁), or just chat with the agent (💬). The diagram updates whenever you reverse-engineer a log.');
+  if (!state.settings.apiKey) pushSystem('Tip: open ⚙ Settings to add your Anthropic API key first.');
 }
 
-// ------------------------------ Render ------------------------------
+// ------------------------------ Diagram ------------------------------
 function renderBreadcrumbs() {
   els.breadcrumbs.innerHTML = '';
   const root = document.createElement('span');
-  root.className = 'crumb';
-  root.textContent = 'Root';
+  root.className = 'crumb'; root.textContent = 'Root';
   root.onclick = () => { state.drillPath = []; rerender(); };
   els.breadcrumbs.appendChild(root);
-
-  let cursor = state.sessions[state.activeId].model.nodes;
+  let cursor = activeSession(state).model.nodes;
   for (let i = 0; i < state.drillPath.length; i++) {
     const id = state.drillPath[i];
     const node = (cursor || []).find(n => n.id === id);
@@ -167,65 +242,156 @@ async function rerender() {
   renderBreadcrumbs();
 }
 
-// ------------------------------ Submit log ------------------------------
+// ------------------------------ Reverse-engineer (one log/chunk) ------------------------------
 let busy = false;
-async function onSubmit() {
-  if (busy) return;
-  const txt = els.logInput.value.trim();
-  if (!txt) return;
+
+async function submitOne(rawText, { prefix = '', source = 'paste' } = {}) {
+  const bubble = makeAssistantBubble(prefix ? `${prefix} · thinking` : 'thinking', 'assistant');
+  bubble.setStage(STAGE_LABELS.submitting);
+  bubble.startTicking();
+
+  const onProgress = (p) => {
+    if (typeof p === 'string') {
+      bubble.setStage(STAGE_LABELS[p] || p);
+    } else if (p && p.stage === 'streaming' && p.delta) {
+      bubble.appendThink(p.delta);
+    } else if (p && p.stage) {
+      bubble.setStage(STAGE_LABELS[p.stage] || p.stage);
+    }
+  };
+
+  try {
+    const res = await reverseEngineer({ state, logText: rawText, onProgress });
+    bubble.stopTicking();
+    if (!res.ok) {
+      bubble.setError(res.error || 'Unknown error');
+      if (res.raw) {
+        const pre = document.createElement('pre');
+        pre.textContent = String(res.raw).slice(0, 2000);
+        bubble.div.appendChild(pre);
+      }
+      // persist as error message
+      appendMessage(state, { role: 'error', label: 'error', text: res.error || '', meta: { source } });
+      persist(state);
+      return false;
+    }
+    bubble.setStage(STAGE_LABELS.done);
+    bubble.div.querySelector('.label').textContent = prefix ? `${prefix} · reverse-engineered` : 'reverse-engineered';
+    if (res.thinking) bubble.div.querySelector('.think').textContent = res.thinking;
+    bubble.setSummary(res.summary || '(no summary)');
+    appendMessage(state, {
+      role: 'assistant',
+      label: prefix ? `${prefix} · reverse-engineered` : 'reverse-engineered',
+      text: res.summary || '',
+      thinking: res.thinking || '',
+      status: STAGE_LABELS.done,
+      meta: { source },
+    });
+    persist(state);
+    await rerender();
+    return true;
+  } catch (e) {
+    bubble.setError(e.message || String(e));
+    appendMessage(state, { role: 'error', label: 'error', text: e.message || String(e) });
+    persist(state);
+    return false;
+  }
+}
+
+async function submitLogText(rawText, { source = 'paste', filename } = {}) {
+  if (!rawText || !rawText.trim()) return;
   if (!state.settings.apiKey) {
     pushError('No Anthropic API key set. Open ⚙ Settings and paste your key.');
     return;
   }
-  busy = true;
-  els.submitLog.disabled = true;
-  pushMsg({ role: 'user', label: 'log', body: txt.length > 600 ? txt.slice(0, 600) + '…' : txt });
-  const stageMsg = pushMsg({ role: 'assistant', label: 'thinking', body: '⏳ submitting…' });
+  if (busy) { pushSystem('Busy — please wait for the current request to finish.'); return; }
+  busy = true; els.submitLog.disabled = true; els.askBtn.disabled = true; els.uploadBtn.disabled = true;
   try {
-    const res = await reverseEngineer({
-      state,
-      logText: txt,
-      onProgress: (stage) => {
-        const map = {
-          submitting: '⏳ submitting log…',
-          awaiting:   '🤔 awaiting Claude response…',
-          parsing:    '🧩 parsing inferred architecture…',
-          merging:    '🧮 merging into existing model…',
-          done:       '✅ done',
-        };
-        const b = stageMsg.querySelector('.summary');
-        if (b) b.textContent = map[stage] || stage;
-      },
-    });
-    if (!res.ok) {
-      stageMsg.classList.remove('assistant');
-      stageMsg.classList.add('error');
-      stageMsg.querySelector('.summary').textContent = res.error;
-      if (res.raw) {
-        const pre = document.createElement('pre');
-        pre.textContent = res.raw;
-        stageMsg.appendChild(pre);
+    const headLabel = filename ? `log file · ${filename}` : 'log';
+    pushMsg({ role: 'user', label: headLabel, body: rawText.length > 600 ? rawText.slice(0, 600) + '…' : rawText });
+    if (shouldChunk(rawText)) {
+      const chunks = splitLogText(rawText);
+      pushSystem(`🗂️ ${filename ? `"${filename}"` : 'Log'} is ${(rawText.length/1024).toFixed(1)} KB — splitting into ${chunks.length} chunks and processing sequentially.`);
+      for (const c of chunks) {
+        pushSystem(`📄 ${chunkBanner(c)}`);
+        const ok = await submitOne(c.text, { prefix: `chunk ${c.index + 1}/${c.total}`, source });
+        if (!ok) { pushSystem('⏸️ Stopping further chunks due to the previous error.'); break; }
       }
     } else {
-      stageMsg.querySelector('.label').textContent = 'reverse-engineered';
-      const think = document.createElement('div');
-      think.className = 'think'; think.textContent = res.thinking || '';
-      stageMsg.insertBefore(think, stageMsg.querySelector('.summary'));
-      stageMsg.querySelector('.summary').textContent = res.summary || '(no summary)';
-      els.logInput.value = '';
-      await rerender();
+      await submitOne(rawText, { source });
     }
-  } catch (e) {
-    pushError(e.message || String(e));
   } finally {
-    busy = false;
-    els.submitLog.disabled = false;
+    busy = false; els.submitLog.disabled = false; els.askBtn.disabled = false; els.uploadBtn.disabled = false;
   }
 }
 
+// ------------------------------ Ask agent ------------------------------
+async function askAgent(question) {
+  if (!question || !question.trim()) return;
+  if (!state.settings.apiKey) { pushError('No Anthropic API key set. Open ⚙ Settings and paste your key.'); return; }
+  if (busy) { pushSystem('Busy — please wait.'); return; }
+  busy = true; els.submitLog.disabled = true; els.askBtn.disabled = true; els.uploadBtn.disabled = true;
+  pushMsg({ role: 'user', label: 'ask', body: question });
+  const bubble = makeAssistantBubble('agent', 'chat');
+  bubble.setStage('🤔 Thinking…');
+  bubble.startTicking();
+  try {
+    let liveText = '';
+    const res = await chatWithAgent({
+      state,
+      userMessage: question,
+      onProgress: (p) => {
+        if (typeof p === 'string') {
+          if (p === 'submitting') bubble.setStage('📤 Sending question…');
+          else if (p === 'awaiting') bubble.setStage('🌐 Awaiting agent reply…');
+          else if (p === 'done') bubble.setStage('✅ Done');
+          else bubble.setStage(p);
+        } else if (p && p.stage === 'streaming' && p.delta) {
+          liveText += p.delta;
+          bubble.div.querySelector('.summary').textContent = liveText;
+          els.chat.scrollTop = els.chat.scrollHeight;
+        }
+      },
+    });
+    bubble.stopTicking();
+    if (!res.ok) {
+      bubble.setError(res.error || 'Unknown error');
+      appendMessage(state, { role: 'error', label: 'agent error', text: res.error || '' });
+      persist(state);
+      return;
+    }
+    const finalText = res.reply || liveText || '(no reply)';
+    bubble.div.querySelector('.summary').textContent = finalText;
+    bubble.setStage('✅ Done');
+    appendMessage(state, { role: 'chat', label: 'agent', text: finalText });
+    persist(state);
+  } catch (e) {
+    bubble.setError(e.message || String(e));
+  } finally {
+    busy = false; els.submitLog.disabled = false; els.askBtn.disabled = false; els.uploadBtn.disabled = false;
+  }
+}
+
+// ------------------------------ File upload ------------------------------
+async function handleFiles(fileList) {
+  const files = Array.from(fileList || []);
+  if (!files.length) return;
+  if (!state.settings.apiKey) { pushError('No Anthropic API key set. Open ⚙ Settings and paste your key.'); return; }
+  for (const file of files) {
+    try {
+      const text = await file.text();
+      pushSystem(`📁 Reading "${file.name}" (${(file.size/1024).toFixed(1)} KB)…`);
+      await submitLogText(text, { source: 'upload', filename: file.name });
+    } catch (e) {
+      pushError(`Failed to read "${file.name}": ${e.message}`);
+    }
+  }
+  els.logFile.value = '';
+}
+
 // ------------------------------ Modals ------------------------------
-function openModal(m) { m.classList.add('open'); }
-function closeModal(m) { m.classList.remove('open'); }
+const openModal  = (m) => m.classList.add('open');
+const closeModal = (m) => m.classList.remove('open');
 
 function openSettings() {
   els.apiKey.value = state.settings.apiKey || '';
@@ -243,46 +409,32 @@ function saveSettings() {
 function openMerge() {
   const list = listSessions(state).filter(s => s.id !== state.activeId);
   els.mergeSelect.innerHTML = '';
-  if (list.length === 0) {
+  if (!list.length) {
     const opt = document.createElement('option');
     opt.textContent = '(no other sessions)'; opt.disabled = true;
     els.mergeSelect.appendChild(opt);
   } else {
     for (const s of list) {
       const opt = document.createElement('option');
-      opt.value = s.id; opt.textContent = s.name;
-      els.mergeSelect.appendChild(opt);
+      opt.value = s.id; opt.textContent = s.name; els.mergeSelect.appendChild(opt);
     }
   }
   openModal(els.mergeModal);
 }
-
 function doMerge(ids) {
   const sess = activeSession(state);
   let merged = sess.model;
-  for (const id of ids) {
-    const other = state.sessions[id];
-    if (!other) continue;
-    merged = mergeModel(merged, other.model);
-  }
+  for (const id of ids) { if (state.sessions[id]) merged = mergeModel(merged, state.sessions[id].model); }
   setActiveModel(state, merged);
   persist(state);
   closeModal(els.mergeModal);
   pushSystem(`Merged ${ids.length} session${ids.length === 1 ? '' : 's'} into "${sess.name}".`);
   rerender();
 }
-
-function openRename() {
-  els.renameInput.value = activeSession(state).name;
-  openModal(els.renameModal);
-}
+function openRename() { els.renameInput.value = activeSession(state).name; openModal(els.renameModal); }
 function confirmRename() {
   const n = els.renameInput.value.trim();
-  if (n) {
-    activeSession(state).name = n;
-    persist(state);
-    refreshSessionSelect();
-  }
+  if (n) { activeSession(state).name = n; persist(state); refreshSessionSelect(); }
   closeModal(els.renameModal);
 }
 
@@ -292,8 +444,6 @@ function init() {
     startOnLoad: false, theme: 'dark', securityLevel: 'loose',
     flowchart: { htmlLabels: true, curve: 'basis' },
   });
-
-  // Mermaid click directives call this global
   window.aiareClick = (id) => {
     const sess = activeSession(state);
     let cursor = sess.model.nodes;
@@ -308,12 +458,10 @@ function init() {
     }
   };
 
-  // Top bar
   els.sessionSelect.addEventListener('change', e => switchSession(e.target.value));
   els.newSession.addEventListener('click', () => {
     const id = createSession(state, `Session ${listSessions(state).length + 1}`);
-    persist(state);
-    switchSession(id);
+    persist(state); switchSession(id);
   });
   els.renameSession.addEventListener('click', openRename);
   els.settingsBtn.addEventListener('click', openSettings);
@@ -324,35 +472,33 @@ function init() {
     downloadText(code, `${activeSession(state).name}.mmd`, 'text/plain');
   });
   els.resetSession.addEventListener('click', () => {
-    if (!confirm('Clear all logs and the model in this session?')) return;
-    clearActiveSession(state);
-    persist(state);
-    state.drillPath = [];
-    els.chat.innerHTML = '';
-    pushSystem('Session cleared.');
-    promptForFirstLog();
-    rerender();
+    if (!confirm('Clear logs, model, and chat history in this session?')) return;
+    clearActiveSession(state); persist(state);
+    state.drillPath = []; els.chat.innerHTML = '';
+    pushSystem('Session cleared.'); promptForFirstLog(); rerender();
   });
 
-  // Canvas controls
   els.fitBtn.addEventListener('click', () => { state.zoom = 1; setZoom(1); });
   els.zoomIn.addEventListener('click', () => { state.zoom = Math.min(3, (state.zoom || 1) + 0.15); setZoom(state.zoom); });
   els.zoomOut.addEventListener('click', () => { state.zoom = Math.max(0.4, (state.zoom || 1) - 0.15); setZoom(state.zoom); });
   els.canvasWrap.addEventListener('mouseleave', hideTooltip);
 
-  // Right pane
   els.mergeBtn.addEventListener('click', openMerge);
-  els.submitLog.addEventListener('click', onSubmit);
+  els.submitLog.addEventListener('click', () => { const t = els.logInput.value.trim(); if (t) { submitLogText(t); els.logInput.value = ''; } });
+  els.askBtn.addEventListener('click',     () => { const t = els.logInput.value.trim(); if (t) { askAgent(t);       els.logInput.value = ''; } });
   els.exampleBtn.addEventListener('click', () => { els.logInput.value = EXAMPLE_LOG; els.logInput.focus(); });
+  els.uploadBtn.addEventListener('click',  () => els.logFile.click());
+  els.logFile.addEventListener('change',   (e) => handleFiles(e.target.files));
+
   els.logInput.addEventListener('keydown', (e) => {
-    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); onSubmit(); }
+    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+      e.preventDefault();
+      if (e.shiftKey) els.askBtn.click(); else els.submitLog.click();
+    }
   });
 
-  // Settings modal
   els.settingsCancel.addEventListener('click', () => closeModal(els.settingsModal));
   els.settingsSave.addEventListener('click', saveSettings);
-
-  // Merge modal
   els.mergeCancel.addEventListener('click', () => closeModal(els.mergeModal));
   els.mergeConfirm.addEventListener('click', () => {
     const id = els.mergeSelect.value;
@@ -360,33 +506,22 @@ function init() {
   });
   els.mergeAll.addEventListener('click', () => {
     const ids = listSessions(state).map(s => s.id).filter(id => id !== state.activeId);
-    if (ids.length) doMerge(ids);
-    else closeModal(els.mergeModal);
+    if (ids.length) doMerge(ids); else closeModal(els.mergeModal);
   });
-
-  // Rename modal
   els.renameCancel.addEventListener('click', () => closeModal(els.renameModal));
   els.renameConfirm.addEventListener('click', confirmRename);
 
-  // Click outside modal closes
   for (const m of [els.settingsModal, els.mergeModal, els.renameModal]) {
     m.addEventListener('click', (e) => { if (e.target === m) closeModal(m); });
   }
 
   refreshSessionSelect();
-  if (activeSession(state).logs.length === 0) {
+  rerenderChat();
+  if (activeSession(state).logs.length === 0 && getActiveMessages(state).length === 0) {
     promptForFirstLog();
-    if (!state.settings.apiKey) {
-      pushSystem('Tip: open ⚙ Settings to add your Anthropic API key first.');
-    }
-  } else {
-    pushSystem(`Restored session "${activeSession(state).name}" with ${activeSession(state).logs.length} log${activeSession(state).logs.length === 1 ? '' : 's'}.`);
   }
   rerender();
 }
 
-if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', init);
-} else {
-  init();
-}
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
+else init();

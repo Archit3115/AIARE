@@ -80,6 +80,8 @@
     .msg.assistant .think { color: var(--muted); font-style: italic; white-space: pre-wrap; margin-bottom: 6px; }
     .msg.assistant .summary { color: var(--text); white-space: pre-wrap; }
     .msg.error { background: #3a1818; border: 1px solid #7a2a2a; color: #ffd6d6; }
+    .msg.chat { background: #14243a; border: 1px solid #2a4a78; }
+    .msg.chat .label { color: var(--accent-2); }
     .msg .label { font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); margin-bottom: 4px; }
     .msg pre { white-space: pre-wrap; word-break: break-word; margin: 4px 0 0; font-size: 12px; color: var(--muted); max-height: 120px; overflow: auto; }
     .input-row { padding: 10px; border-top: 1px solid var(--border); background: var(--panel); display: grid; gap: 6px; }
@@ -89,15 +91,14 @@
       border-radius: 6px; padding: 8px 10px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
       font-size: 12px; resize: vertical;
     }
-    .input-row .actions { display: flex; gap: 6px; align-items: center; }
+    .input-row .actions { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
     .input-row button {
       background: var(--accent); color: #0a0d14; border: none; border-radius: 6px;
       padding: 7px 14px; font-weight: 600; cursor: pointer; font-size: 13px;
     }
     .input-row button:disabled { opacity: .5; cursor: not-allowed; }
-    .input-row .ghost-btn {
-      background: var(--panel-2); color: var(--text); border: 1px solid var(--border); font-weight: 400;
-    }
+    .input-row .ghost-btn { background: var(--panel-2); color: var(--text); border: 1px solid var(--border); font-weight: 400; padding: 7px 10px; }
+    .input-row .ghost-btn:hover { border-color: var(--accent); }
     .input-row .hint { color: var(--muted); font-size: 11px; }
 
     /* Modal */
@@ -185,12 +186,16 @@
         </div>
         <div class="chat" id="chat"></div>
         <div class="input-row">
-          <textarea id="log-input" placeholder="Paste a log line, stack trace, or pipeline event here…"></textarea>
+          <input type="file" id="log-file" hidden multiple accept=".txt,.log,.json,.yaml,.yml,.csv,.out,text/*" />
+          <textarea id="log-input" placeholder="Paste a log here, or ask the agent a question about the current architecture…"></textarea>
           <div class="actions">
-            <button id="submit-log">Reverse-engineer ⏎</button>
+            <button id="upload-btn" class="ghost-btn" title="Upload one or more log files from your computer">📁 Upload log file(s)</button>
             <button id="example-btn" class="ghost-btn">Use example log</button>
-            <span class="hint">Cmd/Ctrl+Enter to submit</span>
+            <span class="hint" style="flex:1"></span>
+            <button id="ask-btn" class="ghost-btn" title="Send the textbox content as a question to the agent (does not modify the diagram)">💬 Ask agent</button>
+            <button id="submit-log" title="Reverse-engineer the textbox content as a log">Reverse-engineer ⏎</button>
           </div>
+          <div class="hint">Cmd/Ctrl+Enter = reverse-engineer · Shift+Enter = newline · 📁 to upload files</div>
         </div>
       </div>
     </div>

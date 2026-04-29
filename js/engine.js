@@ -35,8 +35,89 @@ Output ONLY a single JSON object with this exact shape, no prose, no code fences
   "edges": [...]
 }`;
 
-/** Call Claude messages API from the browser and return parsed JSON object. */
-export async function callClaude({ apiKey, model, system, user, maxTokens = 4096 }) {
+function extractJsonObject(text) {
+  if (!text) throw new Error('Empty response from Claude');
+  // Find first '{'
+  const start = text.indexOf('{');
+  if (start < 0) throw new Error('No JSON object found in response: ' + text.slice(0, 300));
+  let depth = 0;
+  let inStr = false;
+  let escape = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (inStr) {
+      if (escape) { escape = false; continue; }
+      if (ch === '\\') { escape = true; continue; }
+      if (ch === '"') { inStr = false; continue; }
+      continue;
+    }
+    if (ch === '"') { inStr = true; continue; }
+    if (ch === '{') depth++;
+    else if (ch === '}') {
+      depth--;
+      if (depth === 0) {
+        const slice = text.slice(start, i + 1);
+        try { return JSON.parse(slice); }
+        catch (e) {
+          const err = new Error('Could not parse JSON from Claude response: ' + slice.slice(0, 300));
+          err.raw = slice;
+          throw err;
+        }
+      }
+    }
+  }
+  // Reached end without closing brace -> truncated
+  const err = new Error('JSON object in Claude response is unterminated (likely truncated). First 300 chars: ' + text.slice(start, start + 300));
+  err.raw = text;
+  throw err;
+}
+
+/** Internal: read an Anthropic SSE stream from a fetch Response. */
+async function readSseStream(res, { onTextDelta, onEvent } = {}) {
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder('utf-8');
+  let buffer = '';
+  let assistantText = '';
+  let stopReason = null;
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let idx;
+    while ((idx = buffer.indexOf('\n\n')) >= 0) {
+      const frame = buffer.slice(0, idx);
+      buffer = buffer.slice(idx + 2);
+      if (!frame.trim()) continue;
+      const lines = frame.split('\n');
+      let evType = null, dataLine = null;
+      for (const line of lines) {
+        if (line.startsWith('event:')) evType = line.slice(6).trim();
+        else if (line.startsWith('data:')) dataLine = line.slice(5).trim();
+      }
+      if (!dataLine) continue;
+      let payload;
+      try { payload = JSON.parse(dataLine); } catch { continue; }
+      if (payload.type === 'content_block_delta' && payload.delta && payload.delta.type === 'text_delta') {
+        assistantText += payload.delta.text;
+        try { onTextDelta && onTextDelta(payload.delta.text); } catch (_) {}
+      } else if (payload.type === 'message_delta') {
+        if (payload.delta && payload.delta.stop_reason) stopReason = payload.delta.stop_reason;
+      }
+      try { onEvent && onEvent({ type: payload.type || evType, payload }); } catch (_) {}
+    }
+  }
+  return { assistantText, stopReason };
+}
+
+/** Call Claude messages API from the browser. Returns parsed JSON object by default, or raw text if asJson=false. */
+export async function callClaude({ apiKey, model, system, user, maxTokens = 16384, asJson = true, stream = false, onTextDelta, onEvent }) {
+  const body = {
+    model,
+    max_tokens: maxTokens,
+    system,
+    messages: [{ role: 'user', content: user }],
+  };
+  if (stream) body.stream = true;
   const res = await window.fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
@@ -45,49 +126,31 @@ export async function callClaude({ apiKey, model, system, user, maxTokens = 4096
       'anthropic-dangerous-direct-browser-access': 'true',
       'content-type': 'application/json',
     },
-    body: JSON.stringify({
-      model,
-      max_tokens: maxTokens,
-      system,
-      messages: [{ role: 'user', content: user }],
-    }),
+    body: JSON.stringify(body),
   });
   if (!res.ok) {
     let errText = '';
     try { errText = await res.text(); } catch (_) { errText = ''; }
     throw new Error('Claude API ' + res.status + ': ' + (errText || '').slice(0, 300));
   }
+  if (stream) {
+    const { assistantText, stopReason } = await readSseStream(res, { onTextDelta, onEvent });
+    if (stopReason === 'max_tokens') {
+      throw new Error('Claude response was truncated (hit max_tokens=' + maxTokens + '). Try a shorter log or increase the limit.');
+    }
+    if (asJson === false) return assistantText;
+    return extractJsonObject(assistantText);
+  }
   const data = await res.json();
   const blocks = Array.isArray(data && data.content) ? data.content : [];
-  const raw = blocks.filter(b => b && b.type === 'text').map(b => b.text || '').join('');
-  // Find first balanced {...} block
-  let start = -1;
-  for (let i = 0; i < raw.length; i++) { if (raw[i] === '{') { start = i; break; } }
-  if (start === -1) {
-    throw new Error('Could not parse JSON from Claude response: ' + raw.slice(0, 300));
+  const assistantText = blocks.filter(b => b && b.type === 'text').map(b => b.text || '').join('');
+  if (asJson === false) {
+    return assistantText;
   }
-  let depth = 0, end = -1, inStr = false, esc = false;
-  for (let i = start; i < raw.length; i++) {
-    const c = raw[i];
-    if (inStr) {
-      if (esc) { esc = false; }
-      else if (c === '\\') { esc = true; }
-      else if (c === '"') { inStr = false; }
-      continue;
-    }
-    if (c === '"') { inStr = true; continue; }
-    if (c === '{') depth++;
-    else if (c === '}') { depth--; if (depth === 0) { end = i; break; } }
+  if (data && data.stop_reason === 'max_tokens') {
+    throw new Error('Claude response was truncated (hit max_tokens=' + maxTokens + '). Try a shorter log or increase the limit.');
   }
-  if (end === -1) {
-    throw new Error('Could not parse JSON from Claude response: ' + raw.slice(0, 300));
-  }
-  const slice = raw.slice(start, end + 1);
-  try {
-    return JSON.parse(slice);
-  } catch (_) {
-    throw new Error('Could not parse JSON from Claude response: ' + raw.slice(0, 300));
-  }
+  return extractJsonObject(assistantText);
 }
 
 /** Defensive merge: keep prev concrete nodes/edges the LLM may have dropped. */
@@ -256,6 +319,13 @@ export async function reverseEngineer({ state, logText, onProgress }) {
       model: state.settings.model,
       system: SYSTEM_PROMPT,
       user,
+      stream: true,
+      onTextDelta: (delta) => {
+        try { onProgress && onProgress({ stage: 'streaming', delta }); } catch (_) {}
+      },
+      onEvent: (e) => {
+        try { onProgress && onProgress({ stage: 'event', event: e }); } catch (_) {}
+      },
     });
 
     onProgress && onProgress('parsing');
@@ -263,13 +333,17 @@ export async function reverseEngineer({ state, logText, onProgress }) {
       return { ok: false, error: 'Claude response missing nodes/edges arrays.', raw: resp };
     }
 
-    onProgress && onProgress('merging');
+    onProgress && onProgress('validating');
     const llmModel = {
       nodes: resp.nodes,
       edges: resp.edges,
       version: (prevModel.version || 0) + 1,
     };
+
+    onProgress && onProgress('merging');
     const merged = defensiveMerge(prevModel, llmModel);
+
+    onProgress && onProgress('persisting');
     setActiveModel(state, merged);
     persist(state);
 
@@ -282,5 +356,59 @@ export async function reverseEngineer({ state, logText, onProgress }) {
     };
   } catch (err) {
     return { ok: false, error: err && err.message ? err.message : String(err), raw: err && err.raw };
+  }
+}
+
+const CHAT_SYSTEM_PROMPT = `You are AIARE's AI agent. The user has been incrementally reverse-engineering a system architecture from logs. They may ask you general questions about the current architecture, ask for explanations of inferred components, suggest changes, or just chat. Use the provided JSON architecture model as context. Reply in plain prose (NOT JSON). Be concise (3-8 sentences) unless asked for detail. If the user references nodes by label, identify them in the model. If a question can't be answered from the model alone, say what additional log evidence would help.`;
+
+/**
+ * Free-form chat with the agent about the current architecture.
+ * Does NOT modify the model. Returns { ok, reply, error? }.
+ * Uses storage.appendMessage to record both user message and assistant reply.
+ */
+export async function chatWithAgent({ state, userMessage, onProgress }) {
+  if (!state?.settings?.apiKey) {
+    return { ok: false, error: 'No Anthropic API key set. Open Settings and paste your key.' };
+  }
+  if (!userMessage || !userMessage.trim()) {
+    return { ok: false, error: 'Empty message.' };
+  }
+  try {
+    onProgress?.('submitting');
+    const sess = activeSession(state);
+    const recentHistory = (sess.messages || []).slice(-10)
+      .filter(m => m.role === 'user' || m.role === 'assistant')
+      .map(m => `${m.role.toUpperCase()}: ${m.text}`)
+      .join('\n');
+    const user = `Active session: ${sess.name}
+Logs ingested so far: ${(sess.logs || []).length}
+Current architecture model:
+${JSON.stringify(sess.model, null, 2)}
+
+Recent conversation:
+${recentHistory || '(none)'}
+
+User question:
+${userMessage}`;
+    onProgress?.('awaiting');
+    const data = await callClaude({
+      apiKey: state.settings.apiKey,
+      model: state.settings.model || 'claude-sonnet-4-6',
+      system: CHAT_SYSTEM_PROMPT,
+      user,
+      maxTokens: 1024,
+      asJson: false,
+      stream: true,
+      onTextDelta: (delta) => {
+        try { onProgress?.({ stage: 'streaming', delta }); } catch (_) {}
+      },
+      onEvent: (e) => {
+        try { onProgress?.({ stage: 'event', event: e }); } catch (_) {}
+      },
+    });
+    onProgress?.('done');
+    return { ok: true, reply: typeof data === 'string' ? data : (data?.reply || JSON.stringify(data)) };
+  } catch (err) {
+    return { ok: false, error: err.message || String(err), raw: err.raw };
   }
 }

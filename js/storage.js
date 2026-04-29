@@ -38,6 +38,10 @@ export function loadAll() {
   } else if (!state.sessions[state.activeId]) {
     state.activeId = Object.keys(state.sessions)[0];
   }
+  // Migration: ensure every session has a messages array.
+  for (const s of Object.values(state.sessions)) {
+    if (!Array.isArray(s.messages)) s.messages = [];
+  }
   return state;
 }
 
@@ -61,6 +65,7 @@ export function createSession(state, name) {
     name: name || ('Session ' + count),
     createdAt: Date.now(),
     logs: [],
+    messages: [],
     model: { ...DEFAULT_MODEL, nodes: [], edges: [] },
   };
   state.sessions[id] = session;
@@ -100,6 +105,7 @@ export function clearActiveSession(state) {
   const s = activeSession(state);
   if (!s) return;
   s.logs = [];
+  s.messages = [];
   s.model = { ...DEFAULT_MODEL, nodes: [], edges: [], version: 0 };
 }
 
@@ -122,4 +128,31 @@ export function appendLog(state, raw) {
   const entry = { id: newId('l'), ingestedAt: Date.now(), raw: raw };
   s.logs.push(entry);
   return entry;
+}
+
+/**
+ * Append a chat-pane message to the active session and return the stored entry.
+ * `message` shape: { role: 'user'|'assistant'|'system'|'log'|'error'|'chat', text: string, label?: string, thinking?: string, meta?: object }
+ */
+export function appendMessage(state, message) {
+  const sess = activeSession(state);
+  if (!sess) return null;
+  if (!Array.isArray(sess.messages)) sess.messages = [];
+  const entry = {
+    id: newId('m'),
+    timestamp: Date.now(),
+    ...message,
+  };
+  sess.messages.push(entry);
+  return entry;
+}
+
+/**
+ * Return the messages array of the active session (always an array, never null).
+ */
+export function getActiveMessages(state) {
+  const sess = activeSession(state);
+  if (!sess) return [];
+  if (!Array.isArray(sess.messages)) sess.messages = [];
+  return sess.messages;
 }
