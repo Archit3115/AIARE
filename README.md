@@ -177,7 +177,7 @@ sequenceDiagram
     E->>L: extract delta
     L-->>E: new entities, resolved ghosts, still-unknown
     E->>E: diff + merge into model
-    E-->>C: stream "Resolved auth-mw to concrete; new queue order.events found; 2 unknowns remain"
+    E-->>C: stream "Resolved auth-mw to concrete, new queue order.events found, 2 unknowns remain"
     E->>D: re-render Mermaid v2 (animated diff)
     E->>S: persist model + log2
 
