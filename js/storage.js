@@ -8,7 +8,12 @@ export const STORAGE_KEYS = {
 
 export const DEFAULT_MODEL = { nodes: [], edges: [], version: 0 };
 
-export const DEFAULT_SETTINGS = { apiKey: '', model: 'claude-sonnet-4-6' };
+export const DEFAULT_SETTINGS = {
+  provider: 'anthropic',
+  apiKey: '',
+  model: 'claude-sonnet-4-6',
+  baseUrl: '',          // only used for OpenAI-compatible; '' means use api.openai.com/v1
+};
 
 /** Generate a stable id with optional prefix. */
 export function newId(prefix) {
@@ -28,7 +33,13 @@ export function loadAll() {
   const sessions = safeParse(window.localStorage.getItem(STORAGE_KEYS.sessions), null) || {};
   let activeId  = safeParse(window.localStorage.getItem(STORAGE_KEYS.active), null) || '';
   const loadedSettings = safeParse(window.localStorage.getItem(STORAGE_KEYS.settings), null) || {};
-  const settings = { ...DEFAULT_SETTINGS, ...loadedSettings };
+  const s = loadedSettings || {};
+  const settings = {
+    provider: s.provider || DEFAULT_SETTINGS.provider,
+    apiKey:   s.apiKey   || DEFAULT_SETTINGS.apiKey,
+    model:    s.model    || DEFAULT_SETTINGS.model,
+    baseUrl:  s.baseUrl  || DEFAULT_SETTINGS.baseUrl,
+  };
 
   const state = { sessions, activeId, settings, drillPath: [], zoom: 1 };
 

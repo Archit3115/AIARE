@@ -48,8 +48,11 @@ const els = {
   exampleBtn:    $('example-btn'),
 
   settingsModal: $('settings-modal'),
+  providerSelect:$('provider-select'),
   apiKey:        $('api-key'),
-  modelSelect:   $('model-select'),
+  baseUrl:       $('base-url'),
+  baseUrlRow:    $('base-url-row'),
+  modelInput:    $('model-input'),
   settingsCancel:$('settings-cancel'),
   settingsSave:  $('settings-save'),
 
@@ -194,7 +197,7 @@ function switchSession(id) {
 
 function promptForFirstLog() {
   pushSystem('Paste a log, upload a file (📁), or just chat with the agent (💬). The diagram updates whenever you reverse-engineer a log.');
-  if (!state.settings.apiKey) pushSystem('Tip: open ⚙ Settings to add your Anthropic API key first.');
+  if (!state.settings.apiKey) pushSystem('Tip: open ⚙ Settings to pick an LLM provider and paste your API key.');
 }
 
 // ------------------------------ Diagram ------------------------------
@@ -301,7 +304,7 @@ async function submitOne(rawText, { prefix = '', source = 'paste' } = {}) {
 async function submitLogText(rawText, { source = 'paste', filename } = {}) {
   if (!rawText || !rawText.trim()) return;
   if (!state.settings.apiKey) {
-    pushError('No Anthropic API key set. Open ⚙ Settings and paste your key.');
+    pushError('No API key set. Open ⚙ Settings and pick a provider + paste your key.');
     return;
   }
   if (busy) { pushSystem('Busy — please wait for the current request to finish.'); return; }
@@ -328,7 +331,7 @@ async function submitLogText(rawText, { source = 'paste', filename } = {}) {
 // ------------------------------ Ask agent ------------------------------
 async function askAgent(question) {
   if (!question || !question.trim()) return;
-  if (!state.settings.apiKey) { pushError('No Anthropic API key set. Open ⚙ Settings and paste your key.'); return; }
+  if (!state.settings.apiKey) { pushError('No API key set. Open ⚙ Settings and pick a provider + paste your key.'); return; }
   if (busy) { pushSystem('Busy — please wait.'); return; }
   busy = true; els.submitLog.disabled = true; els.askBtn.disabled = true; els.uploadBtn.disabled = true;
   pushMsg({ role: 'user', label: 'ask', body: question });
@@ -376,7 +379,7 @@ async function askAgent(question) {
 async function handleFiles(fileList) {
   const files = Array.from(fileList || []);
   if (!files.length) return;
-  if (!state.settings.apiKey) { pushError('No Anthropic API key set. Open ⚙ Settings and paste your key.'); return; }
+  if (!state.settings.apiKey) { pushError('No API key set. Open ⚙ Settings and pick a provider + paste your key.'); return; }
   for (const file of files) {
     try {
       const text = await file.text();
@@ -393,17 +396,30 @@ async function handleFiles(fileList) {
 const openModal  = (m) => m.classList.add('open');
 const closeModal = (m) => m.classList.remove('open');
 
+function syncSettingsModalForProvider() {
+  const p = els.providerSelect.value;
+  els.baseUrlRow.style.display = (p === 'openai') ? '' : 'none';
+  // Suggest a default model placeholder per provider
+  if (p === 'anthropic') els.modelInput.placeholder = 'claude-sonnet-4-6';
+  else if (p === 'openai') els.modelInput.placeholder = 'gpt-4o-mini (or any model your endpoint serves)';
+  else if (p === 'gemini') els.modelInput.placeholder = 'gemini-2.0-flash';
+}
 function openSettings() {
+  els.providerSelect.value = state.settings.provider || 'anthropic';
   els.apiKey.value = state.settings.apiKey || '';
-  els.modelSelect.value = state.settings.model || 'claude-sonnet-4-6';
+  els.baseUrl.value = state.settings.baseUrl || '';
+  els.modelInput.value = state.settings.model || '';
+  syncSettingsModalForProvider();
   openModal(els.settingsModal);
 }
 function saveSettings() {
-  state.settings.apiKey = els.apiKey.value.trim();
-  state.settings.model  = els.modelSelect.value;
+  state.settings.provider = els.providerSelect.value;
+  state.settings.apiKey   = els.apiKey.value.trim();
+  state.settings.baseUrl  = els.baseUrl.value.trim();
+  state.settings.model    = els.modelInput.value.trim() || (state.settings.provider === 'gemini' ? 'gemini-2.0-flash' : state.settings.provider === 'openai' ? 'gpt-4o-mini' : 'claude-sonnet-4-6');
   persist(state);
   closeModal(els.settingsModal);
-  pushSystem('Settings saved.');
+  pushSystem(`Settings saved — provider: ${state.settings.provider}, model: ${state.settings.model}.`);
 }
 
 function openMerge() {
@@ -499,6 +515,7 @@ function init() {
 
   els.settingsCancel.addEventListener('click', () => closeModal(els.settingsModal));
   els.settingsSave.addEventListener('click', saveSettings);
+  els.providerSelect.addEventListener('change', syncSettingsModalForProvider);
   els.mergeCancel.addEventListener('click', () => closeModal(els.mergeModal));
   els.mergeConfirm.addEventListener('click', () => {
     const id = els.mergeSelect.value;

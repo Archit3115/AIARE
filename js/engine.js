@@ -72,13 +72,11 @@ function extractJsonObject(text) {
   throw err;
 }
 
-/** Internal: read an Anthropic SSE stream from a fetch Response. */
-async function readSseStream(res, { onTextDelta, onEvent } = {}) {
+/** Internal: read an SSE stream from a fetch Response, calling onFrame(frameString) for each '\n\n'-separated frame. */
+async function readSseStream(res, onFrame) {
   const reader = res.body.getReader();
   const decoder = new TextDecoder('utf-8');
   let buffer = '';
-  let assistantText = '';
-  let stopReason = null;
   while (true) {
     const { value, done } = await reader.read();
     if (done) break;
@@ -87,36 +85,21 @@ async function readSseStream(res, { onTextDelta, onEvent } = {}) {
     while ((idx = buffer.indexOf('\n\n')) >= 0) {
       const frame = buffer.slice(0, idx);
       buffer = buffer.slice(idx + 2);
-      if (!frame.trim()) continue;
-      const lines = frame.split('\n');
-      let evType = null, dataLine = null;
-      for (const line of lines) {
-        if (line.startsWith('event:')) evType = line.slice(6).trim();
-        else if (line.startsWith('data:')) dataLine = line.slice(5).trim();
-      }
-      if (!dataLine) continue;
-      let payload;
-      try { payload = JSON.parse(dataLine); } catch { continue; }
-      if (payload.type === 'content_block_delta' && payload.delta && payload.delta.type === 'text_delta') {
-        assistantText += payload.delta.text;
-        try { onTextDelta && onTextDelta(payload.delta.text); } catch (_) {}
-      } else if (payload.type === 'message_delta') {
-        if (payload.delta && payload.delta.stop_reason) stopReason = payload.delta.stop_reason;
-      }
-      try { onEvent && onEvent({ type: payload.type || evType, payload }); } catch (_) {}
+      if (frame.trim()) onFrame(frame);
     }
   }
-  return { assistantText, stopReason };
+  if (buffer.trim()) onFrame(buffer);
 }
 
-/** Call Claude messages API from the browser. Returns parsed JSON object by default, or raw text if asJson=false. */
-export async function callClaude({ apiKey, model, system, user, maxTokens = 16384, asJson = true, stream = false, onTextDelta, onEvent }) {
-  const body = {
-    model,
-    max_tokens: maxTokens,
-    system,
-    messages: [{ role: 'user', content: user }],
-  };
+function providerLabel(p) {
+  if (p === 'openai') return 'OpenAI';
+  if (p === 'gemini') return 'Gemini';
+  return 'Anthropic';
+}
+
+/** Anthropic Messages API. */
+async function callAnthropic({ apiKey, model, system, user, maxTokens, asJson, stream, onTextDelta, onEvent }) {
+  const body = { model, max_tokens: maxTokens, system, messages: [{ role: 'user', content: user }] };
   if (stream) body.stream = true;
   const res = await window.fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
@@ -129,28 +112,184 @@ export async function callClaude({ apiKey, model, system, user, maxTokens = 1638
     body: JSON.stringify(body),
   });
   if (!res.ok) {
-    let errText = '';
-    try { errText = await res.text(); } catch (_) { errText = ''; }
-    throw new Error('Claude API ' + res.status + ': ' + (errText || '').slice(0, 300));
+    let errText = ''; try { errText = await res.text(); } catch (_) {}
+    throw new Error('Anthropic API ' + res.status + ': ' + errText.slice(0, 300));
   }
+  let assistantText = '';
+  let stopReason = null;
   if (stream) {
-    const { assistantText, stopReason } = await readSseStream(res, { onTextDelta, onEvent });
-    if (stopReason === 'max_tokens') {
-      throw new Error('Claude response was truncated (hit max_tokens=' + maxTokens + '). Try a shorter log or increase the limit.');
-    }
-    if (asJson === false) return assistantText;
-    return extractJsonObject(assistantText);
+    await readSseStream(res, (frame) => {
+      const lines = frame.split('\n');
+      let evType = null, dataLine = null;
+      for (const line of lines) {
+        if (line.startsWith('event:')) evType = line.slice(6).trim();
+        else if (line.startsWith('data:')) dataLine = line.slice(5).trim();
+      }
+      if (!dataLine) return;
+      let payload; try { payload = JSON.parse(dataLine); } catch { return; }
+      if (payload.type === 'content_block_delta' && payload.delta?.type === 'text_delta') {
+        assistantText += payload.delta.text;
+        try { onTextDelta && onTextDelta(payload.delta.text); } catch {}
+      } else if (payload.type === 'message_delta' && payload.delta?.stop_reason) {
+        stopReason = payload.delta.stop_reason;
+      }
+      try { onEvent && onEvent({ type: payload.type || evType, payload }); } catch {}
+    });
+  } else {
+    const data = await res.json();
+    const blocks = Array.isArray(data?.content) ? data.content : [];
+    assistantText = blocks.filter(b => b?.type === 'text').map(b => b.text || '').join('');
+    stopReason = data?.stop_reason || null;
   }
-  const data = await res.json();
-  const blocks = Array.isArray(data && data.content) ? data.content : [];
-  const assistantText = blocks.filter(b => b && b.type === 'text').map(b => b.text || '').join('');
-  if (asJson === false) {
-    return assistantText;
+  if (stopReason === 'max_tokens') {
+    throw new Error('Anthropic response was truncated (hit max_tokens=' + maxTokens + '). Try a shorter log or raise the limit.');
   }
-  if (data && data.stop_reason === 'max_tokens') {
-    throw new Error('Claude response was truncated (hit max_tokens=' + maxTokens + '). Try a shorter log or increase the limit.');
-  }
+  if (asJson === false) return assistantText;
   return extractJsonObject(assistantText);
+}
+
+/** OpenAI-compatible Chat Completions (OpenAI, Groq, OpenRouter, DeepSeek, Together, vLLM, ...). */
+async function callOpenAI({ apiKey, baseUrl, model, system, user, maxTokens, asJson, stream, onTextDelta, onEvent }) {
+  const url = (baseUrl || 'https://api.openai.com/v1').replace(/\/+$/, '') + '/chat/completions';
+  const body = {
+    model,
+    max_tokens: maxTokens,
+    messages: [
+      { role: 'system', content: system },
+      { role: 'user', content: user },
+    ],
+  };
+  if (stream) body.stream = true;
+  const res = await window.fetch(url, {
+    method: 'POST',
+    headers: {
+      'Authorization': 'Bearer ' + apiKey,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    let errText = ''; try { errText = await res.text(); } catch (_) {}
+    throw new Error('OpenAI API ' + res.status + ': ' + errText.slice(0, 300));
+  }
+  let assistantText = '';
+  let stopReason = null;
+  if (stream) {
+    await readSseStream(res, (frame) => {
+      // Frames are usually just `data: {...}` (sometimes with no event:)
+      const lines = frame.split('\n');
+      for (const line of lines) {
+        if (!line.startsWith('data:')) continue;
+        const data = line.slice(5).trim();
+        if (!data || data === '[DONE]') continue;
+        let payload; try { payload = JSON.parse(data); } catch { continue; }
+        const choice = payload.choices && payload.choices[0];
+        if (!choice) continue;
+        const delta = choice.delta && choice.delta.content;
+        if (delta) {
+          assistantText += delta;
+          try { onTextDelta && onTextDelta(delta); } catch {}
+        }
+        if (choice.finish_reason) stopReason = choice.finish_reason;
+        try { onEvent && onEvent({ type: 'chunk', payload }); } catch {}
+      }
+    });
+  } else {
+    const data = await res.json();
+    const choice = data?.choices && data.choices[0];
+    assistantText = choice?.message?.content || '';
+    stopReason = choice?.finish_reason || null;
+  }
+  if (stopReason === 'length') {
+    throw new Error('OpenAI response was truncated (hit max_tokens=' + maxTokens + '). Try a shorter log or raise the limit.');
+  }
+  if (asJson === false) return assistantText;
+  return extractJsonObject(assistantText);
+}
+
+/** Google Gemini generateContent / streamGenerateContent. */
+async function callGemini({ apiKey, model, system, user, maxTokens, asJson, stream, onTextDelta, onEvent }) {
+  const base = 'https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model);
+  const url = stream
+    ? base + ':streamGenerateContent?alt=sse&key=' + encodeURIComponent(apiKey)
+    : base + ':generateContent?key=' + encodeURIComponent(apiKey);
+  const body = {
+    systemInstruction: { parts: [{ text: system }] },
+    contents: [{ role: 'user', parts: [{ text: user }] }],
+    generationConfig: { maxOutputTokens: maxTokens },
+  };
+  const res = await window.fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    let errText = ''; try { errText = await res.text(); } catch (_) {}
+    throw new Error('Gemini API ' + res.status + ': ' + errText.slice(0, 300));
+  }
+  let assistantText = '';
+  let stopReason = null;
+  if (stream) {
+    await readSseStream(res, (frame) => {
+      const lines = frame.split('\n');
+      for (const line of lines) {
+        if (!line.startsWith('data:')) continue;
+        const data = line.slice(5).trim();
+        if (!data) continue;
+        let payload; try { payload = JSON.parse(data); } catch { continue; }
+        const cand = payload.candidates && payload.candidates[0];
+        if (!cand) continue;
+        const parts = cand.content && cand.content.parts;
+        if (Array.isArray(parts)) {
+          for (const p of parts) {
+            if (p && typeof p.text === 'string' && p.text.length) {
+              assistantText += p.text;
+              try { onTextDelta && onTextDelta(p.text); } catch {}
+            }
+          }
+        }
+        if (cand.finishReason) stopReason = cand.finishReason;
+        try { onEvent && onEvent({ type: 'chunk', payload }); } catch {}
+      }
+    });
+  } else {
+    const data = await res.json();
+    const cand = data?.candidates && data.candidates[0];
+    const parts = cand?.content?.parts || [];
+    assistantText = parts.map(p => p?.text || '').join('');
+    stopReason = cand?.finishReason || null;
+  }
+  if (stopReason === 'MAX_TOKENS') {
+    throw new Error('Gemini response was truncated (hit maxOutputTokens=' + maxTokens + '). Try a shorter log or raise the limit.');
+  }
+  if (asJson === false) return assistantText;
+  return extractJsonObject(assistantText);
+}
+
+/** Provider-agnostic LLM call. Dispatches on settings.provider. */
+export async function callLLM({ settings, system, user, maxTokens = 16384, asJson = true, stream = false, onTextDelta, onEvent }) {
+  const provider = (settings && settings.provider) || 'anthropic';
+  const apiKey   = settings && settings.apiKey;
+  const model    = settings && settings.model;
+  const baseUrl  = settings && settings.baseUrl;
+  const opts = { apiKey, baseUrl, model, system, user, maxTokens, asJson, stream, onTextDelta, onEvent };
+  switch (provider) {
+    case 'openai': return callOpenAI(opts);
+    case 'gemini': return callGemini(opts);
+    case 'anthropic':
+    default:       return callAnthropic(opts);
+  }
+}
+
+/** Back-compat alias. Older callers passed { apiKey, model, ... } directly; route them to Anthropic. */
+export async function callClaude(opts) {
+  if (opts && opts.settings) return callLLM(opts);
+  return callLLM({
+    settings: { provider: 'anthropic', apiKey: opts.apiKey, model: opts.model, baseUrl: '' },
+    system: opts.system, user: opts.user,
+    maxTokens: opts.maxTokens, asJson: opts.asJson, stream: opts.stream,
+    onTextDelta: opts.onTextDelta, onEvent: opts.onEvent,
+  });
 }
 
 /** Defensive merge: keep prev concrete nodes/edges the LLM may have dropped. */
@@ -296,7 +435,8 @@ export function mergeModel(a, b) {
 export async function reverseEngineer({ state, logText, onProgress }) {
   try {
     if (!state || !state.settings || !state.settings.apiKey) {
-      return { ok: false, error: 'No Anthropic API key set. Open Settings and paste your key.' };
+      const prov = (state && state.settings && state.settings.provider) || 'anthropic';
+      return { ok: false, error: 'No API key set for ' + providerLabel(prov) + '. Open Settings.' };
     }
     onProgress && onProgress('submitting');
     const entry = appendLog(state, logText);
@@ -314,9 +454,8 @@ export async function reverseEngineer({ state, logText, onProgress }) {
       logText;
 
     onProgress && onProgress('awaiting');
-    const resp = await callClaude({
-      apiKey: state.settings.apiKey,
-      model: state.settings.model,
+    const resp = await callLLM({
+      settings: state.settings,
       system: SYSTEM_PROMPT,
       user,
       stream: true,
@@ -368,7 +507,8 @@ const CHAT_SYSTEM_PROMPT = `You are AIARE's AI agent. The user has been incremen
  */
 export async function chatWithAgent({ state, userMessage, onProgress }) {
   if (!state?.settings?.apiKey) {
-    return { ok: false, error: 'No Anthropic API key set. Open Settings and paste your key.' };
+    const prov = state?.settings?.provider || 'anthropic';
+    return { ok: false, error: 'No API key set for ' + providerLabel(prov) + '. Open Settings.' };
   }
   if (!userMessage || !userMessage.trim()) {
     return { ok: false, error: 'Empty message.' };
@@ -391,9 +531,8 @@ ${recentHistory || '(none)'}
 User question:
 ${userMessage}`;
     onProgress?.('awaiting');
-    const data = await callClaude({
-      apiKey: state.settings.apiKey,
-      model: state.settings.model || 'claude-sonnet-4-6',
+    const data = await callLLM({
+      settings: state.settings,
       system: CHAT_SYSTEM_PROMPT,
       user,
       maxTokens: 1024,
