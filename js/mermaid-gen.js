@@ -54,8 +54,18 @@ function nodeLine(node) {
   const safeId = sanitizeId(node.id);
   const safeLabel = sanitizeLabel(node.label || node.id || '');
   const cls = classFor(kind);
-  const ghost = node.ghost ? ':::ghost' : '';
-  return `${safeId}["${safeLabel}<br/><i>${kind.toLowerCase()}</i>"]:::${cls}${ghost}`;
+  // Apply only the kind class with `:::`. Ghost styling is applied via a
+  // separate `class <id> ghost` directive at the bottom of the diagram —
+  // Mermaid 10 doesn't accept chained `:::a:::b` syntax.
+  return `${safeId}["${safeLabel}<br/><i>${kind.toLowerCase()}</i>"]:::${cls}`;
+}
+
+function ghostClassLines(nodes) {
+  const ids = (nodes || []).filter(n => n && n.ghost).map(n => sanitizeId(n.id));
+  if (!ids.length) return [];
+  // De-dupe and chunk to keep lines reasonable.
+  const uniq = Array.from(new Set(ids));
+  return [`class ${uniq.join(',')} ghost`];
 }
 
 function clickLine(node) {
@@ -111,6 +121,9 @@ function buildTopLevel(model) {
     lines.push(`${sanitizeId(e.from)} ${arrow}${lbl} ${sanitizeId(e.to)}`);
   }
 
+  // Apply ghost class to ghost nodes (separate directive — see nodeLine).
+  for (const l of ghostClassLines(nodes)) lines.push(l);
+
   // Click directives (sorted by id for stability)
   const clickNodes = nodes.slice().sort((a, b) => String(a.id).localeCompare(String(b.id)));
   for (const n of clickNodes) lines.push(clickLine(n));
@@ -142,6 +155,9 @@ function buildDrill(model, target) {
   const targetId = sanitizeId(target.id);
   for (const c of children) lines.push(`${targetId} --> ${sanitizeId(c.id)}`);
   for (const rid of resIds) lines.push(`${targetId} --> ${rid}`);
+
+  // Apply ghost class to ghost nodes (target + children).
+  for (const l of ghostClassLines([target, ...children])) lines.push(l);
 
   // Click for target + children, not resources
   lines.push(clickLine(target));
