@@ -582,7 +582,80 @@ export function mergeModel(a, b) {
 }
 
 /** Top-level orchestrator: append log, call Claude, merge defensively, persist. */
-export async function reverseEngineer({ state, logText, onProgress }) {
+/**
+ * System prompt for the cheap "scout" pass — produces a short structured
+ * overview of an input file/log block before the (expensive) reverse-engineer
+ * pass runs. Output is small so this call is fast and cheap.
+ */
+const OVERVIEW_SYSTEM_PROMPT = `You are AIARE's input scout. Given a structural preview of a log file or text block (size, type, head, tail, sample lines, distinct services seen), produce a concise overview the next agent can use to plan the architecture extraction WITHOUT re-reading the whole file.
+
+Output ONLY a single JSON object with this exact shape, no prose, no code fences:
+{
+  "kind":       "log" | "json" | "yaml" | "config" | "structured-export" | "unknown",
+  "summary":    "2-3 sentence high-level description of what this file represents",
+  "components": ["short list of component types you expect to find — e.g. service, queue, db, dag, pipeline, transformer"],
+  "estimates":  { "service": <int>, "queue": <int>, "db": <int>, "...": <int> },
+  "strategy":   "1-2 sentences on the best extraction strategy (process whole file, split by tenant, focus on top-level keys, etc.)",
+  "keyEntities": ["up to 12 specific named entities you spot — e.g. 'checkout-api', 'order.events', 'rgmdev'"]
+}
+
+Be terse. Use empty arrays / 0 estimates if unknown. Don't speculate; if the preview only shows partial info say so in summary.`;
+
+/**
+ * Cheap upfront scout pass over a preview produced by `js/preview.js`.
+ * Produces a small overview JSON the caller can pass into reverseEngineer
+ * to give every subsequent chunk shared context (instead of re-deriving it
+ * from raw text each time).
+ *
+ * Returns { ok: true, overview } or { ok: false, error }.
+ */
+export async function analyzeInput({ state, preview, onProgress }) {
+  try {
+    if (!state || !state.settings || !state.settings.apiKey) {
+      const prov = (state && state.settings && state.settings.provider) || 'anthropic';
+      return { ok: false, error: 'No API key set for ' + providerLabel(prov) + '. Open Settings.' };
+    }
+    if (!preview || typeof preview !== 'object') {
+      return { ok: false, error: 'analyzeInput called without a preview object.' };
+    }
+    onProgress && onProgress('scouting');
+    const previewBlock =
+      'File: ' + (preview.name || 'pasted-input') + '\n' +
+      'Size: ' + (preview.sizeKB || 0) + ' KB, ' + (preview.lineCount || 0) + ' lines\n' +
+      'Detected type: ' + (preview.type || 'unknown') + '\n' +
+      (preview.jsonTopKeys && preview.jsonTopKeys.length
+        ? 'JSON top-level keys: ' + preview.jsonTopKeys.join(', ') + '\n'
+        : '') +
+      (preview.distinctServices && preview.distinctServices.length
+        ? 'Distinct service tokens: ' + preview.distinctServices.join(', ') + '\n'
+        : '') +
+      (preview.distinctLevels && preview.distinctLevels.length
+        ? 'Log levels seen: ' + preview.distinctLevels.join(', ') + '\n'
+        : '') +
+      (preview.sampleLines && preview.sampleLines.length
+        ? '\nSample lines:\n' + preview.sampleLines.slice(0, 12).map(l => '  ' + (l || '').slice(0, 240)).join('\n') + '\n'
+        : '') +
+      '\nHead (first ~2KB):\n' + (preview.head || '').slice(0, 2000) +
+      (preview.tail ? '\n\nTail (last ~1KB):\n' + preview.tail.slice(0, 1000) : '');
+
+    onProgress && onProgress('awaiting');
+    const overview = await callLLM({
+      settings: state.settings,
+      system: buildSystemPrompt(OVERVIEW_SYSTEM_PROMPT, !!(state.settings && state.settings.caveman)),
+      user: previewBlock,
+      maxTokens: 1024,
+      stream: true,
+      onTextDelta: (delta) => { try { onProgress && onProgress({ stage: 'streaming', delta }); } catch (_) {} },
+      onEvent:     (e)     => { try { onProgress && onProgress({ stage: 'event', event: e }); } catch (_) {} },
+    });
+    onProgress && onProgress('done');
+    return { ok: true, overview };
+  } catch (err) {
+    return { ok: false, error: (err && err.message) ? err.message : String(err), raw: err && err.raw };
+  }
+}
+
+export async function reverseEngineer({ state, logText, onProgress, overview }) {
   try {
     if (!state || !state.settings || !state.settings.apiKey) {
       const prov = (state && state.settings && state.settings.provider) || 'anthropic';
@@ -598,6 +671,7 @@ export async function reverseEngineer({ state, logText, onProgress }) {
     const user =
       'Active session: ' + sessName + '\n' +
       'Logs so far (ids): ' + logIds + '\n' +
+      (overview ? ('Upfront overview (from a previous scout pass — use it to skip redundant ghost guesses):\n' + (typeof overview === 'string' ? overview : JSON.stringify(overview, null, 2)) + '\n\n') : '') +
       'Current model:\n' +
       JSON.stringify(prevModel, null, 2) + '\n' +
       'New log (id=' + newLogId + '):\n' +

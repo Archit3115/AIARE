@@ -8,8 +8,9 @@ import {
   appendMessage, getActiveMessages,
 } from './js/storage.js';
 import {
-  EXAMPLE_LOG, reverseEngineer, mergeModel, chatWithAgent,
+  EXAMPLE_LOG, reverseEngineer, mergeModel, chatWithAgent, analyzeInput,
 } from './js/engine.js';
+import { previewText } from './js/preview.js';
 import { buildMermaid } from './js/mermaid-gen.js';
 import {
   renderDiagram, showTooltip, hideTooltip, setZoom,
@@ -300,7 +301,7 @@ async function rerender() {
 // ------------------------------ Reverse-engineer (one log/chunk) ------------------------------
 let busy = false;
 
-async function submitOne(rawText, { prefix = '', source = 'paste' } = {}) {
+async function submitOne(rawText, { prefix = '', source = 'paste', overview } = {}) {
   const bubble = makeAssistantBubble(prefix ? `${prefix} · thinking` : 'thinking', 'assistant');
   bubble.setStage(STAGE_LABELS.submitting);
   bubble.startTicking();
@@ -316,7 +317,7 @@ async function submitOne(rawText, { prefix = '', source = 'paste' } = {}) {
   };
 
   try {
-    const res = await reverseEngineer({ state, logText: rawText, onProgress });
+    const res = await reverseEngineer({ state, logText: rawText, onProgress, overview });
     bubble.stopTicking();
     if (!res.ok) {
       bubble.setError(res.error || 'Unknown error');
@@ -353,6 +354,47 @@ async function submitOne(rawText, { prefix = '', source = 'paste' } = {}) {
   }
 }
 
+// Threshold above which we do a "scout" pass first (cheap LLM call to summarise
+// the input) before the actual reverse-engineer pass(es). Below this size we
+// skip the scout — overhead would outweigh benefit.
+const SCOUT_THRESHOLD_BYTES = 6 * 1024;
+
+async function runScout(rawText, filename) {
+  const preview = previewText(rawText, filename || 'pasted-input');
+  pushSystem(`🔍 Scouting "${preview.name}" — ${preview.sizeKB} KB, ${preview.lineCount} lines, type=${preview.type}${preview.distinctServices.length ? `, ~${preview.distinctServices.length} distinct service tokens` : ''}.`);
+  const bubble = makeAssistantBubble('scout', 'assistant');
+  bubble.setStage('🔭 Generating overview…');
+  bubble.startTicking();
+  const onProgress = (p) => {
+    if (typeof p === 'string') {
+      const map = { scouting: '🔭 Building input preview…', awaiting: '🌐 Asking LLM for overview…', done: '✅ Overview ready' };
+      bubble.setStage(map[p] || p);
+    } else if (p && p.stage === 'streaming' && p.delta) {
+      bubble.appendThink(p.delta);
+    }
+  };
+  const res = await analyzeInput({ state, preview, onProgress });
+  bubble.stopTicking();
+  if (!res.ok) {
+    bubble.setError(res.error || 'Scout failed');
+    appendMessage(state, { role: 'error', label: 'scout error', text: res.error || '' });
+    persist(state);
+    return null;
+  }
+  bubble.setStage('✅ Overview ready');
+  bubble.div.querySelector('.label').textContent = 'scout · overview';
+  const ov = res.overview || {};
+  const summary = `📋 ${ov.summary || ''}` +
+    (Array.isArray(ov.components) && ov.components.length ? `\nExpected components: ${ov.components.join(', ')}` : '') +
+    (ov.estimates ? `\nEstimates: ${JSON.stringify(ov.estimates)}` : '') +
+    (Array.isArray(ov.keyEntities) && ov.keyEntities.length ? `\nKey entities: ${ov.keyEntities.slice(0, 12).join(', ')}` : '') +
+    (ov.strategy ? `\nStrategy: ${ov.strategy}` : '');
+  bubble.setSummary(summary);
+  appendMessage(state, { role: 'assistant', label: 'scout · overview', text: summary, status: '✅ Overview ready' });
+  persist(state);
+  return ov;
+}
+
 async function submitLogText(rawText, { source = 'paste', filename } = {}) {
   if (!rawText || !rawText.trim()) return;
   if (!state.settings.apiKey) {
@@ -364,16 +406,25 @@ async function submitLogText(rawText, { source = 'paste', filename } = {}) {
   try {
     const headLabel = filename ? `log file · ${filename}` : 'log';
     pushMsg({ role: 'user', label: headLabel, body: rawText.length > 600 ? rawText.slice(0, 600) + '…' : rawText });
+
+    // Scout pass for files / large pastes — gives every chunk shared context.
+    let overview = null;
+    const shouldScout = !!filename || rawText.length >= SCOUT_THRESHOLD_BYTES;
+    if (shouldScout) {
+      overview = await runScout(rawText, filename);
+      // If scout failed, continue without overview (degrade gracefully).
+    }
+
     if (shouldChunk(rawText)) {
       const chunks = splitLogText(rawText);
-      pushSystem(`🗂️ ${filename ? `"${filename}"` : 'Log'} is ${(rawText.length/1024).toFixed(1)} KB — splitting into ${chunks.length} chunks and processing sequentially.`);
+      pushSystem(`🗂️ ${filename ? `"${filename}"` : 'Log'} is ${(rawText.length/1024).toFixed(1)} KB — splitting into ${chunks.length} chunks and processing sequentially${overview ? ' (each chunk will reuse the scout overview)' : ''}.`);
       for (const c of chunks) {
         pushSystem(`📄 ${chunkBanner(c)}`);
-        const ok = await submitOne(c.text, { prefix: `chunk ${c.index + 1}/${c.total}`, source });
+        const ok = await submitOne(c.text, { prefix: `chunk ${c.index + 1}/${c.total}`, source, overview });
         if (!ok) { pushSystem('⏸️ Stopping further chunks due to the previous error.'); break; }
       }
     } else {
-      await submitOne(rawText, { source });
+      await submitOne(rawText, { source, overview });
     }
   } finally {
     busy = false; els.submitLog.disabled = false; els.askBtn.disabled = false; els.uploadBtn.disabled = false;
