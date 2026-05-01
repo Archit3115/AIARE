@@ -16,6 +16,9 @@ import {
   downloadSvg, downloadPng, downloadText,
 } from './js/renderer.js';
 import { splitLogText, shouldChunk, chunkBanner } from './js/chunker.js';
+import {
+  computeViews, pickActiveViewId, subModelForView, viewTabLabel, isRootView,
+} from './js/views.js';
 
 const $ = (id) => document.getElementById(id);
 const state = loadAll();
@@ -37,6 +40,7 @@ const els = {
   zoomOut:       $('zoom-out'),
   canvasWrap:    $('canvas-wrap'),
   canvas:        $('mermaid-canvas'),
+  viewTabsBar:   $('view-tabs'),
 
   mergeBtn:      $('merge-btn'),
   chat:          $('chat'),
@@ -226,13 +230,59 @@ function renderBreadcrumbs() {
   }
 }
 
+function renderViewTabs(views, activeId) {
+  const bar = els.viewTabsBar;
+  if (!bar) return;
+  bar.innerHTML = '';
+  // Hide the tab bar entirely when there's only one (root) view.
+  if (!views || views.length <= 1) { bar.style.display = 'none'; return; }
+  bar.style.display = '';
+  for (const v of views) {
+    const t = document.createElement('span');
+    t.className = 'tab' + (v.id === activeId ? ' active' : '');
+    const lbl = viewTabLabel(v);
+    // Split into name + count so we can style the count differently.
+    const m = lbl.match(/^(.*) \((\d+)\)$/);
+    if (m) {
+      t.appendChild(document.createTextNode(m[1]));
+      const c = document.createElement('span');
+      c.className = 'count'; c.textContent = m[2];
+      t.appendChild(c);
+    } else {
+      t.textContent = lbl;
+    }
+    t.title = `${v.nodeIds.length} node${v.nodeIds.length === 1 ? '' : 's'}`;
+    t.onclick = () => {
+      const sess = activeSession(state);
+      sess.activeViewId = v.id;
+      state.drillPath = [];
+      persist(state);
+      rerender();
+    };
+    bar.appendChild(t);
+  }
+}
+
 async function rerender() {
   const sess = activeSession(state);
-  const code = buildMermaid(sess.model, state.drillPath);
+  const views = computeViews(sess.model);
+  const activeViewId = pickActiveViewId(views, sess.activeViewId);
+  if (activeViewId !== sess.activeViewId) {
+    sess.activeViewId = activeViewId;
+    persist(state);
+  }
+  renderViewTabs(views, activeViewId);
+  const activeView = views.find(v => v.id === activeViewId) || views[0];
+  // When in 'all' mode (only one view) we render the full model. Otherwise
+  // we render the sub-model the active tab represents.
+  const renderModel = (activeView && !isRootView(activeView))
+    ? subModelForView(activeView, sess.model)
+    : sess.model;
+  const code = buildMermaid(renderModel, state.drillPath);
   await renderDiagram({
     mermaidCode: code,
     container: els.canvas,
-    model: sess.model,
+    model: renderModel,
     callbacks: {
       onNodeClick: (node) => {
         if ((node.children && node.children.length) || (node.resources && node.resources.length)) {

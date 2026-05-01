@@ -56,6 +56,7 @@ export function loadAll() {
   // Migration: ensure every session has a messages array.
   for (const s of Object.values(state.sessions)) {
     if (!Array.isArray(s.messages)) s.messages = [];
+    if (typeof s.activeViewId !== 'string') s.activeViewId = 'all';
   }
   return state;
 }
@@ -82,6 +83,7 @@ export function createSession(state, name) {
     logs: [],
     messages: [],
     model: { ...DEFAULT_MODEL, nodes: [], edges: [] },
+    activeViewId: 'all',
   };
   state.sessions[id] = session;
   state.activeId = id;
@@ -122,6 +124,7 @@ export function clearActiveSession(state) {
   s.logs = [];
   s.messages = [];
   s.model = { ...DEFAULT_MODEL, nodes: [], edges: [], version: 0 };
+  s.activeViewId = 'all';
 }
 
 /** Replace the active session's model and bump its version. */

@@ -620,6 +620,19 @@ export async function reverseEngineer({ state, logText, onProgress }) {
     onProgress && onProgress('parsing');
     const shape = detectResponseShape(resp);
     if (shape === 'unknown') {
+      // Some LLMs (especially when running near the token limit) return a JSON
+      // with `thinking` and `summary` but without the structural delta arrays.
+      // Treat that as a no-op so we don't discard the existing architecture
+      // and don't fail the whole submit.
+      if (resp && (resp.thinking || resp.summary)) {
+        onProgress && onProgress('done');
+        return {
+          ok: true,
+          thinking: resp.thinking || '',
+          summary: (resp.summary || '') + ' (note: no structural changes returned — likely hit token limit; architecture left unchanged)',
+          model: prevModel,
+        };
+      }
       return { ok: false, error: 'LLM response was not a delta or full model. Expected nodesAdd/edgesAdd/etc., or nodes/edges.', raw: resp };
     }
 

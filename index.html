@@ -64,6 +64,43 @@
     .canvas-wrap { flex: 1; overflow: auto; padding: 16px; position: relative; }
     .canvas-wrap.empty { display: flex; align-items: center; justify-content: center; color: var(--muted); }
     #mermaid-canvas svg { max-width: 100%; height: auto; cursor: default; }
+    .view-tabs {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+      padding: 6px 12px;
+      border-bottom: 1px solid var(--border);
+      background: var(--panel);
+      font-size: 12px;
+      overflow-x: auto;
+    }
+    .view-tabs .tab {
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 4px 10px;
+      cursor: pointer;
+      color: var(--text);
+      white-space: nowrap;
+      user-select: none;
+    }
+    .view-tabs .tab:hover { border-color: var(--accent); }
+    .view-tabs .tab.active {
+      background: var(--accent);
+      color: #0a0d14;
+      border-color: var(--accent);
+      font-weight: 600;
+    }
+    .view-tabs .tab .count {
+      color: var(--muted);
+      margin-left: 6px;
+      font-size: 11px;
+    }
+    .view-tabs .tab.active .count { color: #0a0d14; opacity: .65; }
+    @media (max-width: 600px) {
+      .view-tabs { padding: 5px 8px; gap: 3px; font-size: 11px; }
+      .view-tabs .tab { padding: 3px 8px; }
+    }
     .legend {
       position: absolute; right: 16px; bottom: 16px;
       background: rgba(22,26,34,.92); border: 1px solid var(--border); border-radius: 8px;
@@ -212,6 +249,9 @@
             <button id="zoom-in">+</button>
             <button id="zoom-out">−</button>
           </div>
+        </div>
+        <div class="view-tabs" id="view-tabs">
+          <!-- populated by app.js as button-like spans -->
         </div>
         <div class="canvas-wrap empty" id="canvas-wrap">
           <div id="mermaid-canvas"></div>
