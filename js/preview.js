@@ -63,7 +63,117 @@ export function previewText(text, name = 'pasted-input') {
     jsonTopKeys,
     distinctServices: distinctServices(safeText),
     distinctLevels:   distinctLevels(safeText),
+    structural: structuralDigest(safeText, type),
   };
+}
+
+/**
+ * Compact structural digest of a JSON / JSONL input — collections, item counts,
+ * sampled items per collection. Returns null if input isn't JSON-shaped.
+ *
+ * For each top-level array we record { kind: 'array', count, itemKeys, samples }
+ * where samples is up to 3 representative items with string fields truncated.
+ * Cap on overall digest size: ~16 KB JSON-stringified.
+ */
+export function structuralDigest(text, type) {
+  if (type !== 'json' && type !== 'jsonl') return null;
+  let parsed;
+  try {
+    if (type === 'jsonl') {
+      // First few lines as separate objects; this gives schema without exploding size.
+      const lines = (text || '').split(/\r?\n/).filter(l => l.trim()).slice(0, 200);
+      const items = [];
+      for (const l of lines) {
+        try { items.push(JSON.parse(l)); } catch (_) {}
+        if (items.length >= 200) break;
+      }
+      parsed = items;
+    } else {
+      parsed = JSON.parse(text);
+    }
+  } catch (_) { return null; }
+  if (!parsed || typeof parsed !== 'object') return null;
+
+  if (Array.isArray(parsed)) {
+    return {
+      shape: 'array',
+      count: parsed.length,
+      itemKeys: extractItemKeys(parsed),
+      samples: sampleObjects(parsed, 3),
+    };
+  }
+
+  const collections = {};
+  for (const [k, v] of Object.entries(parsed)) {
+    if (Array.isArray(v)) {
+      collections[k] = {
+        shape: 'array',
+        count: v.length,
+        itemKeys: extractItemKeys(v),
+        samples: sampleObjects(v, 3),
+      };
+    } else if (v && typeof v === 'object') {
+      collections[k] = {
+        shape: 'object',
+        keys: Object.keys(v).slice(0, 50),
+        sample: truncateValue(v),
+      };
+    } else {
+      collections[k] = { shape: 'scalar', value: truncateValue(v) };
+    }
+  }
+  return { shape: 'object', collections };
+}
+
+function extractItemKeys(arr) {
+  if (!arr.length) return [];
+  // Sample a few items and union their keys (for arrays of heterogeneous shape).
+  const keys = new Set();
+  const probes = [arr[0], arr[Math.floor(arr.length / 2)], arr[arr.length - 1]];
+  for (const it of probes) {
+    if (it && typeof it === 'object' && !Array.isArray(it)) {
+      for (const k of Object.keys(it)) {
+        if (keys.size >= 60) break;
+        keys.add(k);
+      }
+    }
+  }
+  return Array.from(keys);
+}
+
+function sampleObjects(arr, n) {
+  if (!arr.length) return [];
+  if (arr.length <= n) return arr.map(truncateValue);
+  // First, middle(s), last
+  const idxs = [];
+  if (n === 1) idxs.push(0);
+  else if (n === 2) idxs.push(0, arr.length - 1);
+  else {
+    idxs.push(0);
+    for (let i = 1; i < n - 1; i++) idxs.push(Math.floor((arr.length * i) / (n - 1)));
+    idxs.push(arr.length - 1);
+  }
+  return idxs.map(i => truncateValue(arr[i]));
+}
+
+function truncateValue(v, depth = 0) {
+  if (v == null) return v;
+  if (typeof v === 'string') return v.length > 160 ? v.slice(0, 160) + '…' : v;
+  if (typeof v !== 'object') return v;
+  if (depth > 2) return Array.isArray(v) ? `[${v.length} items]` : '{…}';
+  if (Array.isArray(v)) {
+    if (v.length === 0) return [];
+    if (v.length > 4) return [...v.slice(0, 3).map(x => truncateValue(x, depth + 1)), `+${v.length - 3} more`];
+    return v.map(x => truncateValue(x, depth + 1));
+  }
+  const out = {};
+  let kept = 0;
+  for (const [k, val] of Object.entries(v)) {
+    if (kept >= 30) { out['…'] = '+more keys'; break; }
+    out[k] = truncateValue(val, depth + 1);
+    kept++;
+  }
+  return out;
 }
 
 /** Format a preview as a compact, human/LLM-readable string. */

@@ -655,6 +655,114 @@ export async function analyzeInput({ state, preview, onProgress }) {
   }
 }
 
+/**
+ * System prompt for the structural build pass — used for JSON / JSONL / YAML
+ * uploads where the FILE STRUCTURE itself is the architecture (we sampled
+ * collections; we don't need to read every byte). Asks the model to emit
+ * GROUP-LEVEL nodes (one per collection / layer) with counts in labels,
+ * not one node per item.
+ */
+const STRUCTURAL_BUILD_SYSTEM_PROMPT = `You are AIARE's structural architecture builder.
+
+You are given:
+1) A scout overview (kind, summary, expected components, key entities, strategy).
+2) A structural digest of an uploaded file: top-level collections, their item counts, and 2-3 sampled items per collection (string fields truncated).
+3) The current architecture model (likely empty on first call, but may already have nodes).
+
+Build a LAYERED architecture in a SINGLE delta. Critical rules:
+
+- For any collection larger than ~30 items, emit ONE representative GROUP node, not one node per item. Put the count in the label and summary, e.g.
+    { "id":"pipelines", "label":"Pipelines (667)", "kind":"SERVICE", "summary":"667 pipelines built from data nodes + transformers", ...}
+- Group similar entities by role: storage layer, ingestion layer, processing/compute layer, orchestration layer, external sources/sinks, governance (workspaces / tenants / param sets).
+- Emit edges showing the data flow between these groups (Sources → Connectors → Storage → Compute → Orchestration → Sinks/Analytics).
+- Use the SCOUT's "keyEntities" as concrete labels where possible.
+- Keep total emitted node count under ~30. The user will drill in later if they need more detail.
+- Allowed node kinds: SERVICE, MIDDLEWARE, QUEUE, DB, CACHE, UI_TAB, EXTERNAL, UNKNOWN.
+- ghost: false on every node — these are CONFIRMED groups, not speculative.
+
+Output ONLY the standard delta JSON, no prose, no code fences:
+{
+  "thinking": "2-4 sentences describing your structural read",
+  "summary":  "1-2 sentences describing the layered architecture you built",
+  "nodesAdd":     [...],
+  "nodesPromote": [],
+  "nodesUpdate":  [],
+  "edgesAdd":     [...],
+  "edgesPromote": []
+}`;
+
+/**
+ * One-shot structural build: instead of brute-forcing chunked log processing,
+ * this takes a scout overview + a structural digest of the file (collections,
+ * counts, sampled items) and asks the LLM to emit a layered architecture in a
+ * SINGLE delta call. Used for JSON / JSONL / YAML uploads where the structure
+ * IS the architecture.
+ *
+ * Returns { ok, thinking, summary, model } same shape as reverseEngineer.
+ */
+export async function buildFromStructure({ state, preview, overview, onProgress }) {
+  try {
+    if (!state || !state.settings || !state.settings.apiKey) {
+      const prov = (state && state.settings && state.settings.provider) || 'anthropic';
+      return { ok: false, error: 'No API key set for ' + providerLabel(prov) + '. Open Settings.' };
+    }
+    if (!preview || !preview.structural) {
+      return { ok: false, error: 'buildFromStructure requires a preview with a structural digest (JSON/JSONL/YAML inputs only).' };
+    }
+    onProgress && onProgress('submitting');
+    // Synthesize a single log entry recording that we ingested the file.
+    const entry = appendLog(state, '[structural-ingest] ' + (preview.name || 'pasted-input') + ' (' + (preview.sizeKB || 0) + ' KB)');
+    const newLogId = entry ? entry.id : '';
+    const sess = activeSession(state);
+    const prevModel = (sess && sess.model) ? sess.model : { nodes: [], edges: [], version: 0 };
+
+    const user =
+      'File: ' + (preview.name || 'pasted-input') + ' (' + (preview.sizeKB || 0) + ' KB, ' + (preview.lineCount || 0) + ' lines, type=' + preview.type + ')\n\n' +
+      'Scout overview:\n' + JSON.stringify(overview || {}, null, 2) + '\n\n' +
+      'Structural digest of the file:\n' + JSON.stringify(preview.structural, null, 2) + '\n\n' +
+      'Current model (will be merged via delta — only emit NEW nodes/edges):\n' + JSON.stringify(prevModel, null, 2) + '\n\n' +
+      'Build the layered architecture now. New log id for sourceLogIds: ' + newLogId;
+
+    onProgress && onProgress('awaiting');
+    const resp = await callLLM({
+      settings: state.settings,
+      system: buildSystemPrompt(STRUCTURAL_BUILD_SYSTEM_PROMPT, !!(state.settings && state.settings.caveman)),
+      user,
+      stream: true,
+      onTextDelta: (delta) => { try { onProgress && onProgress({ stage: 'streaming', delta }); } catch (_) {} },
+      onEvent:     (e)     => { try { onProgress && onProgress({ stage: 'event', event: e }); } catch (_) {} },
+    });
+
+    onProgress && onProgress('parsing');
+    const shape = detectResponseShape(resp);
+    if (shape === 'unknown') {
+      if (resp && (resp.thinking || resp.summary)) {
+        onProgress && onProgress('done');
+        return { ok: true, thinking: resp.thinking || '', summary: (resp.summary || '') + ' (no structural changes returned)', model: prevModel };
+      }
+      return { ok: false, error: 'Structural build returned an unrecognised JSON shape.', raw: resp };
+    }
+
+    onProgress && onProgress('merging');
+    let merged;
+    if (shape === 'delta') {
+      merged = applyDelta(prevModel, resp);
+    } else {
+      const llmModel = { nodes: resp.nodes, edges: resp.edges, version: (prevModel.version || 0) + 1 };
+      merged = defensiveMerge(prevModel, llmModel);
+    }
+
+    onProgress && onProgress('persisting');
+    setActiveModel(state, merged);
+    persist(state);
+
+    onProgress && onProgress('done');
+    return { ok: true, thinking: resp.thinking || '', summary: resp.summary || '', model: merged };
+  } catch (err) {
+    return { ok: false, error: (err && err.message) ? err.message : String(err), raw: err && err.raw };
+  }
+}
+
 export async function reverseEngineer({ state, logText, onProgress, overview }) {
   try {
     if (!state || !state.settings || !state.settings.apiKey) {

@@ -8,7 +8,7 @@ import {
   appendMessage, getActiveMessages,
 } from './js/storage.js';
 import {
-  EXAMPLE_LOG, reverseEngineer, mergeModel, chatWithAgent, analyzeInput,
+  EXAMPLE_LOG, reverseEngineer, mergeModel, chatWithAgent, analyzeInput, buildFromStructure,
 } from './js/engine.js';
 import { previewText } from './js/preview.js';
 import { buildMermaid } from './js/mermaid-gen.js';
@@ -359,8 +359,8 @@ async function submitOne(rawText, { prefix = '', source = 'paste', overview } = 
 // skip the scout — overhead would outweigh benefit.
 const SCOUT_THRESHOLD_BYTES = 6 * 1024;
 
-async function runScout(rawText, filename) {
-  const preview = previewText(rawText, filename || 'pasted-input');
+async function runScout(rawText, filename, presetPreview) {
+  const preview = presetPreview || previewText(rawText, filename || 'pasted-input');
   pushSystem(`🔍 Scouting "${preview.name}" — ${preview.sizeKB} KB, ${preview.lineCount} lines, type=${preview.type}${preview.distinctServices.length ? `, ~${preview.distinctServices.length} distinct service tokens` : ''}.`);
   const bubble = makeAssistantBubble('scout', 'assistant');
   bubble.setStage('🔭 Generating overview…');
@@ -395,6 +395,57 @@ async function runScout(rawText, filename) {
   return ov;
 }
 
+// One-shot structural build for JSON/JSONL/YAML uploads. Uses the scout overview
+// + the structural digest to emit a layered architecture in a single LLM call.
+async function runStructuralBuild(preview, overview, source) {
+  const bubble = makeAssistantBubble('structural build · thinking', 'assistant');
+  bubble.setStage('🏛️ Building layered architecture from structural digest…');
+  bubble.startTicking();
+  const onProgress = (p) => {
+    if (typeof p === 'string') {
+      const map = {
+        submitting:  '📤 Submitting digest to Claude…',
+        awaiting:    '🌐 Awaiting first byte…',
+        parsing:     '🧩 Parsing inferred architecture JSON…',
+        merging:     '🧮 Merging into existing model…',
+        persisting:  '💾 Saving session…',
+        done:        '✅ Done',
+      };
+      bubble.setStage(map[p] || p);
+    } else if (p && p.stage === 'streaming' && p.delta) {
+      bubble.appendThink(p.delta);
+    }
+  };
+  try {
+    const res = await buildFromStructure({ state, preview, overview, onProgress });
+    bubble.stopTicking();
+    if (!res.ok) {
+      bubble.setError(res.error || 'Structural build failed');
+      appendMessage(state, { role: 'error', label: 'structural build error', text: res.error || '', meta: { source } });
+      persist(state);
+      return false;
+    }
+    bubble.setStage('✅ Done');
+    bubble.div.querySelector('.label').textContent = 'structural build · done';
+    if (res.thinking) bubble.div.querySelector('.think').textContent = res.thinking;
+    bubble.setSummary(res.summary || '(no summary)');
+    appendMessage(state, {
+      role: 'assistant',
+      label: 'structural build · done',
+      text: res.summary || '',
+      thinking: res.thinking || '',
+      status: '✅ Done',
+      meta: { source },
+    });
+    persist(state);
+    await rerender();
+    return true;
+  } catch (e) {
+    bubble.setError(e.message || String(e));
+    return false;
+  }
+}
+
 async function submitLogText(rawText, { source = 'paste', filename } = {}) {
   if (!rawText || !rawText.trim()) return;
   if (!state.settings.apiKey) {
@@ -407,12 +458,27 @@ async function submitLogText(rawText, { source = 'paste', filename } = {}) {
     const headLabel = filename ? `log file · ${filename}` : 'log';
     pushMsg({ role: 'user', label: headLabel, body: rawText.length > 600 ? rawText.slice(0, 600) + '…' : rawText });
 
-    // Scout pass for files / large pastes — gives every chunk shared context.
+    // Scout pass for files / large pastes — gives every chunk shared context
+    // AND, for JSON/JSONL/YAML, a structural digest we can use to build the
+    // architecture in one shot without ever reading byte-by-byte.
     let overview = null;
+    let preview = null;
     const shouldScout = !!filename || rawText.length >= SCOUT_THRESHOLD_BYTES;
     if (shouldScout) {
-      overview = await runScout(rawText, filename);
-      // If scout failed, continue without overview (degrade gracefully).
+      preview = previewText(rawText, filename || 'pasted-input');
+      overview = await runScout(rawText, filename, preview);
+    }
+
+    // Structural build path: if we have a JSON/JSONL/YAML preview with a
+    // structural digest, skip chunking entirely and ask the LLM to emit a
+    // layered architecture in ONE delta call (group nodes with counts, not
+    // 667 individual nodes). Far fewer tokens than 210 chunks.
+    const isStructural = preview && preview.structural &&
+                         (preview.type === 'json' || preview.type === 'jsonl' || preview.type === 'yaml');
+    if (isStructural) {
+      pushSystem(`🏛️ ${filename ? `"${filename}"` : 'Input'} is structured (${preview.type}); building layered architecture in one pass instead of chunking.`);
+      await runStructuralBuild(preview, overview, source);
+      return;
     }
 
     if (shouldChunk(rawText)) {
