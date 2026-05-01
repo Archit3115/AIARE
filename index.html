@@ -135,6 +135,57 @@
 
     /* Mermaid clickable cursor */
     .clickable > * { cursor: pointer !important; }
+
+    /* ------------------------------ Mobile / narrow viewport ------------------------------ */
+    @media (max-width: 900px) {
+      .app { grid-template-rows: auto 1fr; }
+      .main { grid-template-columns: 1fr; grid-template-rows: 50vh 50vh; }
+      .pane.left { border-right: none; border-bottom: 1px solid var(--border); }
+      .topbar {
+        flex-wrap: wrap; height: auto; padding: 6px 8px; gap: 6px;
+      }
+      .topbar .brand .sub { display: none; }
+      .topbar select, .topbar button {
+        padding: 5px 9px; font-size: 12px;
+      }
+      .topbar .spacer { flex-basis: 100%; height: 0; }
+      .canvas-wrap { padding: 10px; }
+      .legend { font-size: 10px; padding: 6px 8px; }
+      .pane-header { padding: 6px 10px; font-size: 12px; }
+      .pane-header button { padding: 3px 8px; font-size: 11px; }
+      .input-row textarea { min-height: 60px; font-size: 13px; }
+      .input-row .actions { gap: 4px; flex-wrap: wrap; }
+      .input-row button { padding: 6px 10px; font-size: 12px; }
+      .modal { width: 92vw; padding: 14px; }
+      #tooltip { max-width: 80vw; }
+    }
+    @media (max-width: 600px) {
+      .topbar { gap: 4px; padding: 5px 6px; }
+      .topbar .brand { font-size: 14px; }
+      .topbar select { max-width: 110px; }
+      .topbar button { padding: 4px 7px; font-size: 11px; }
+      /* On a phone the diagram pane gets the floor, chat pane gets the rest */
+      .main { grid-template-rows: 45vh 1fr; }
+      .legend { display: none; }
+      .canvas-wrap { padding: 6px; }
+      .pane-header { padding: 5px 8px; font-size: 11px; }
+      .input-row { padding: 8px; }
+      .input-row textarea { min-height: 56px; font-size: 12px; }
+      .input-row button { padding: 5px 9px; font-size: 11px; }
+      .input-row .ghost-btn { padding: 5px 9px; }
+      .input-row .hint { font-size: 10px; }
+      .msg { font-size: 12px; padding: 8px 10px; }
+      .msg .label { font-size: 9px; }
+      .msg pre { font-size: 11px; max-height: 90px; }
+      .modal { padding: 12px; }
+      .modal h3 { font-size: 14px; }
+      .modal input, .modal select { padding: 7px 8px; font-size: 12px; }
+    }
+    /* Touch-friendly tap targets on coarse pointers */
+    @media (pointer: coarse) {
+      .topbar button, .pane-header button, .input-row button { min-height: 32px; }
+      .crumb { padding: 4px 10px; }
+    }
   </style>
 </head>
 <body>

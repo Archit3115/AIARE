@@ -13,27 +13,34 @@ export const EXAMPLE_LOG = `2026-04-29T14:22:01Z svc=checkout-api level=info "PO
 export const SYSTEM_PROMPT = `You are AIARE's reverse-engineering engine. Given:
   1) the current architecture model (JSON), and
   2) one new log line (or a short multi-line log block),
-infer the FULL updated architecture and return it as strict JSON.
+return a small JSON DELTA describing only what changes.
 
 Allowed node kinds: SERVICE, MIDDLEWARE, QUEUE, DB, CACHE, UI_TAB, EXTERNAL, UNKNOWN.
 
-Rules:
-- Always return the COMPLETE updated model — don't return only the diff.
-- Preserve previously identified nodes/edges unless the new log contradicts them.
-- If a producer or consumer is implied but not directly observed yet, emit it as a node with "ghost": true. Use kind UNKNOWN if you can't even guess the kind.
-- When a later log confirms a ghost, set "ghost": false in your output and keep the same id.
-- Each node MUST have: id (kebab-case), label (human readable), kind, ghost (boolean), confidence (0-1), summary (one sentence), sourceLogIds (array of log ids that informed it), resources (array; can be empty), children (array of nested nodes; can be empty).
-- Each edge MUST have: id, from (node id), to (node id), protocol (e.g. "HTTP POST /orders", "Kafka topic order.events", "SQL"), ghost, sourceLogIds, summary.
-- thinking: 2-4 sentences of verbose reasoning (what you saw in the log, what you inferred, what's still unknown).
-- summary: 1-2 sentences describing what changed in this iteration (e.g. "Promoted auth-mw to concrete; added new queue order.events with 1 ghost consumer.").
+Output rules:
+- Do NOT echo back unchanged nodes or edges. Only return what is new, promoted, or updated.
+- Use kebab-case node ids. Re-use existing ids when the log refers to a node we already inferred.
+- If a producer or consumer is implied but not directly observed yet, emit it as a node with "ghost": true. Use kind UNKNOWN if you can't even guess.
+- When a new log confirms a previously-ghost node, list its id under "nodesPromote" (this flips ghost: false). Same for edges via "edgesPromote".
+- If a node's summary/resources/confidence/sourceLogIds need updating, add a partial entry to "nodesUpdate" with { id, ...fieldsToChange }.
+
+Each new node in nodesAdd MUST have: id (kebab-case), label, kind, ghost (boolean), confidence (0-1), summary (one sentence), sourceLogIds (array), resources (array; can be empty), children (array; can be empty).
+Each new edge in edgesAdd MUST have: id, from, to, protocol (e.g. "HTTP POST /orders", "Kafka topic order.events", "SQL INSERT"), ghost (boolean), sourceLogIds, summary.
+thinking: 2-4 sentences of verbose reasoning.
+summary: 1-2 sentences describing what changed in this iteration.
 
 Output ONLY a single JSON object with this exact shape, no prose, no code fences:
 {
   "thinking": "...",
   "summary": "...",
-  "nodes": [...],
-  "edges": [...]
-}`;
+  "nodesAdd":     [...],
+  "nodesPromote": ["id1", "id2"],
+  "nodesUpdate":  [{ "id": "auth-svc", "summary": "...", "confidence": 0.9 }],
+  "edgesAdd":     [...],
+  "edgesPromote": ["id1"]
+}
+
+If you have absolutely nothing new for one of these arrays, emit an empty array []. Never omit a key.`;
 
 function extractJsonObject(text) {
   if (!text) throw new Error('Empty response from Claude');
@@ -97,9 +104,20 @@ function providerLabel(p) {
   return 'Anthropic';
 }
 
+/** Raised by a provider call when the model output was cut off due to a token limit. The `partial` field carries whatever was emitted so the caller can resume. */
+class TruncatedError extends Error {
+  constructor(message, partial) {
+    super(message);
+    this.name = 'TruncatedError';
+    this.partial = partial || '';
+  }
+}
+
 /** Anthropic Messages API. */
-async function callAnthropic({ apiKey, model, system, user, maxTokens, asJson, stream, onTextDelta, onEvent }) {
-  const body = { model, max_tokens: maxTokens, system, messages: [{ role: 'user', content: user }] };
+async function callAnthropic({ apiKey, model, system, user, assistantPrefill, maxTokens, asJson, stream, onTextDelta, onEvent }) {
+  const messages = [{ role: 'user', content: user }];
+  if (assistantPrefill) messages.push({ role: 'assistant', content: assistantPrefill });
+  const body = { model, max_tokens: maxTokens, system, messages };
   if (stream) body.stream = true;
   const res = await window.fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
@@ -142,23 +160,21 @@ async function callAnthropic({ apiKey, model, system, user, maxTokens, asJson, s
     stopReason = data?.stop_reason || null;
   }
   if (stopReason === 'max_tokens') {
-    throw new Error('Anthropic response was truncated (hit max_tokens=' + maxTokens + '). Try a shorter log or raise the limit.');
+    throw new TruncatedError('Anthropic hit max_tokens=' + maxTokens, assistantText);
   }
   if (asJson === false) return assistantText;
   return extractJsonObject(assistantText);
 }
 
 /** OpenAI-compatible Chat Completions (OpenAI, Groq, OpenRouter, DeepSeek, Together, vLLM, ...). */
-async function callOpenAI({ apiKey, baseUrl, model, system, user, maxTokens, asJson, stream, onTextDelta, onEvent }) {
+async function callOpenAI({ apiKey, baseUrl, model, system, user, assistantPrefill, maxTokens, asJson, stream, onTextDelta, onEvent }) {
   const url = (baseUrl || 'https://api.openai.com/v1').replace(/\/+$/, '') + '/chat/completions';
-  const body = {
-    model,
-    max_tokens: maxTokens,
-    messages: [
-      { role: 'system', content: system },
-      { role: 'user', content: user },
-    ],
-  };
+  const messages = [
+    { role: 'system', content: system },
+    { role: 'user', content: user },
+  ];
+  if (assistantPrefill) messages.push({ role: 'assistant', content: assistantPrefill });
+  const body = { model, max_tokens: maxTokens, messages };
   if (stream) body.stream = true;
   const res = await window.fetch(url, {
     method: 'POST',
@@ -201,21 +217,23 @@ async function callOpenAI({ apiKey, baseUrl, model, system, user, maxTokens, asJ
     stopReason = choice?.finish_reason || null;
   }
   if (stopReason === 'length') {
-    throw new Error('OpenAI response was truncated (hit max_tokens=' + maxTokens + '). Try a shorter log or raise the limit.');
+    throw new TruncatedError('OpenAI hit max_tokens=' + maxTokens, assistantText);
   }
   if (asJson === false) return assistantText;
   return extractJsonObject(assistantText);
 }
 
 /** Google Gemini generateContent / streamGenerateContent. */
-async function callGemini({ apiKey, model, system, user, maxTokens, asJson, stream, onTextDelta, onEvent }) {
+async function callGemini({ apiKey, model, system, user, assistantPrefill, maxTokens, asJson, stream, onTextDelta, onEvent }) {
   const base = 'https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model);
   const url = stream
     ? base + ':streamGenerateContent?alt=sse&key=' + encodeURIComponent(apiKey)
     : base + ':generateContent?key=' + encodeURIComponent(apiKey);
+  const contents = [{ role: 'user', parts: [{ text: user }] }];
+  if (assistantPrefill) contents.push({ role: 'model', parts: [{ text: assistantPrefill }] });
   const body = {
     systemInstruction: { parts: [{ text: system }] },
-    contents: [{ role: 'user', parts: [{ text: user }] }],
+    contents,
     generationConfig: { maxOutputTokens: maxTokens },
   };
   const res = await window.fetch(url, {
@@ -260,25 +278,73 @@ async function callGemini({ apiKey, model, system, user, maxTokens, asJson, stre
     stopReason = cand?.finishReason || null;
   }
   if (stopReason === 'MAX_TOKENS') {
-    throw new Error('Gemini response was truncated (hit maxOutputTokens=' + maxTokens + '). Try a shorter log or raise the limit.');
+    throw new TruncatedError('Gemini hit maxOutputTokens=' + maxTokens, assistantText);
   }
   if (asJson === false) return assistantText;
   return extractJsonObject(assistantText);
 }
 
-/** Provider-agnostic LLM call. Dispatches on settings.provider. */
-export async function callLLM({ settings, system, user, maxTokens = 16384, asJson = true, stream = false, onTextDelta, onEvent }) {
-  const provider = (settings && settings.provider) || 'anthropic';
-  const apiKey   = settings && settings.apiKey;
-  const model    = settings && settings.model;
-  const baseUrl  = settings && settings.baseUrl;
-  const opts = { apiKey, baseUrl, model, system, user, maxTokens, asJson, stream, onTextDelta, onEvent };
+function dispatchProvider(provider, opts) {
   switch (provider) {
     case 'openai': return callOpenAI(opts);
     case 'gemini': return callGemini(opts);
     case 'anthropic':
     default:       return callAnthropic(opts);
   }
+}
+
+/**
+ * Provider-agnostic LLM call with auto-continuation.
+ *
+ * If the provider truncates the response (max_tokens / length / MAX_TOKENS),
+ * this loops up to `maxContinuations` extra times, sending the partial output
+ * back as an `assistantPrefill` so the model resumes exactly where it stopped.
+ * Subsequent attempts disable streaming because token deltas can't easily be
+ * threaded through a continuation anyway.
+ */
+export async function callLLM({ settings, system, user, maxTokens = 32000, asJson = true, stream = false, onTextDelta, onEvent, maxContinuations = 5 }) {
+  const provider = (settings && settings.provider) || 'anthropic';
+  const baseOpts = {
+    apiKey:  settings && settings.apiKey,
+    baseUrl: settings && settings.baseUrl,
+    model:   settings && settings.model,
+    system, user, maxTokens,
+    asJson: false,                       // we always collect raw text and parse at the end
+    onTextDelta, onEvent,
+  };
+
+  let accumulated = '';
+  let attempt = 0;
+  // First attempt may stream; later continuations are non-streaming for simplicity.
+  while (true) {
+    try {
+      const text = await dispatchProvider(provider, {
+        ...baseOpts,
+        stream: attempt === 0 ? stream : false,
+        assistantPrefill: accumulated || undefined,
+      });
+      accumulated += text;
+      break; // not truncated
+    } catch (err) {
+      if (err && err.name === 'TruncatedError' && attempt < maxContinuations) {
+        accumulated += err.partial || '';
+        attempt++;
+        try { onEvent && onEvent({ type: 'continuation', attempt, totalChars: accumulated.length, lastReason: err.message }); } catch {}
+        try { onTextDelta && onTextDelta(''); } catch {}
+        continue;
+      }
+      if (err && err.name === 'TruncatedError') {
+        // Exhausted all continuations.
+        accumulated += err.partial || '';
+        const e = new Error(`${providerLabel(provider)} response still truncated after ${maxContinuations + 1} attempts (${accumulated.length} chars). Try a shorter input.`);
+        e.raw = accumulated;
+        throw e;
+      }
+      throw err;
+    }
+  }
+  if (asJson === false) return accumulated;
+  return extractJsonObject(accumulated);
 }
 
 /** Back-compat alias. Older callers passed { apiKey, model, ... } directly; route them to Anthropic. */
@@ -290,6 +356,70 @@ export async function callClaude(opts) {
     maxTokens: opts.maxTokens, asJson: opts.asJson, stream: opts.stream,
     onTextDelta: opts.onTextDelta, onEvent: opts.onEvent,
   });
+}
+
+/**
+ * Apply a small delta returned by the LLM to the previous model.
+ * Delta shape: { nodesAdd, nodesPromote, nodesUpdate, edgesAdd, edgesPromote }.
+ * Idempotent: re-applying the same delta is safe.
+ */
+export function applyDelta(prevModel, delta) {
+  const prev = prevModel || { nodes: [], edges: [], version: 0 };
+  const d = delta || {};
+  const byNode = new Map();
+  for (const n of (prev.nodes || [])) {
+    if (n && n.id) byNode.set(String(n.id), n);
+  }
+  const byEdge = new Map();
+  for (const e of (prev.edges || [])) {
+    if (e && e.id) byEdge.set(String(e.id), e);
+  }
+  for (const n of (d.nodesAdd || [])) {
+    if (!n || !n.id) continue;
+    const existing = byNode.get(n.id);
+    byNode.set(n.id, existing ? { ...existing, ...n, sourceLogIds: unionStrings(existing.sourceLogIds, n.sourceLogIds), resources: unionResources(existing.resources, n.resources) } : n);
+  }
+  for (const id of (d.nodesPromote || [])) {
+    const n = byNode.get(String(id));
+    if (n) byNode.set(String(id), { ...n, ghost: false });
+  }
+  for (const upd of (d.nodesUpdate || [])) {
+    if (!upd || !upd.id) continue;
+    const n = byNode.get(String(upd.id));
+    if (!n) continue;
+    byNode.set(String(upd.id), {
+      ...n,
+      ...upd,
+      sourceLogIds: unionStrings(n.sourceLogIds, upd.sourceLogIds),
+      resources: unionResources(n.resources, upd.resources),
+    });
+  }
+  for (const e of (d.edgesAdd || [])) {
+    if (!e || !e.id) continue;
+    const existing = byEdge.get(e.id);
+    byEdge.set(e.id, existing ? { ...existing, ...e, sourceLogIds: unionStrings(existing.sourceLogIds, e.sourceLogIds) } : e);
+  }
+  for (const id of (d.edgesPromote || [])) {
+    const e = byEdge.get(String(id));
+    if (e) byEdge.set(String(id), { ...e, ghost: false });
+  }
+  return {
+    nodes: Array.from(byNode.values()),
+    edges: Array.from(byEdge.values()),
+    version: (prev.version || 0) + 1,
+  };
+}
+
+/**
+ * Detect whether a parsed LLM response is a delta or a full model.
+ * Returns 'delta' | 'full' | 'unknown'.
+ */
+export function detectResponseShape(resp) {
+  if (!resp || typeof resp !== 'object') return 'unknown';
+  const isDeltaShape = ['nodesAdd', 'nodesPromote', 'nodesUpdate', 'edgesAdd', 'edgesPromote'].some(k => Array.isArray(resp[k]));
+  if (isDeltaShape) return 'delta';
+  if (Array.isArray(resp.nodes) && Array.isArray(resp.edges)) return 'full';
+  return 'unknown';
 }
 
 /** Defensive merge: keep prev concrete nodes/edges the LLM may have dropped. */
@@ -468,19 +598,21 @@ export async function reverseEngineer({ state, logText, onProgress }) {
     });
 
     onProgress && onProgress('parsing');
-    if (!resp || !Array.isArray(resp.nodes) || !Array.isArray(resp.edges)) {
-      return { ok: false, error: 'Claude response missing nodes/edges arrays.', raw: resp };
+    const shape = detectResponseShape(resp);
+    if (shape === 'unknown') {
+      return { ok: false, error: 'LLM response was not a delta or full model. Expected nodesAdd/edgesAdd/etc., or nodes/edges.', raw: resp };
     }
 
     onProgress && onProgress('validating');
-    const llmModel = {
-      nodes: resp.nodes,
-      edges: resp.edges,
-      version: (prevModel.version || 0) + 1,
-    };
 
     onProgress && onProgress('merging');
-    const merged = defensiveMerge(prevModel, llmModel);
+    let merged;
+    if (shape === 'delta') {
+      merged = applyDelta(prevModel, resp);
+    } else {
+      const llmModel = { nodes: resp.nodes, edges: resp.edges, version: (prevModel.version || 0) + 1 };
+      merged = defensiveMerge(prevModel, llmModel);
+    }
 
     onProgress && onProgress('persisting');
     setActiveModel(state, merged);
