@@ -277,6 +277,11 @@
         <input id="model-custom" type="text" placeholder="Type a custom model id" style="display:none; margin-top:6px" autocomplete="off" />
       </label>
 
+      <label style="display:flex; flex-direction:row; align-items:flex-start; gap:8px;">
+        <input id="caveman-toggle" type="checkbox" style="margin-top:3px; flex:0 0 auto;" />
+        <span>🪨 Caveman mode <span style="color:var(--muted); font-weight:400">— terse prose, ~65% fewer output tokens (structured JSON kept exact). Inspired by <a href="https://github.com/juliusbrussee/caveman" target="_blank" rel="noopener" style="color:var(--accent)">caveman</a>.</span></span>
+      </label>
+
       <div class="help">
         Your key is stored locally in this browser only and is sent directly to the provider's API.
         For OpenAI-compatible endpoints (Groq, OpenRouter, DeepSeek, Together, vLLM, etc.), set the

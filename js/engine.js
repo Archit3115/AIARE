@@ -42,6 +42,26 @@ Output ONLY a single JSON object with this exact shape, no prose, no code fences
 
 If you have absolutely nothing new for one of these arrays, emit an empty array []. Never omit a key.`;
 
+/**
+ * Caveman-mode prefix — prompt-engineering trick that asks the model to drop
+ * articles and use sentence fragments in *prose* fields, while keeping the
+ * structured JSON shape exact. Empirically reduces output prose tokens ~65%.
+ * Inspired by https://github.com/juliusbrussee/caveman (MIT).
+ */
+const CAVEMAN_DIRECTIVE = `RESPONSE STYLE — CAVEMAN MODE (token saver):
+- Be EXTREMELY terse in prose-only fields ("thinking", "summary", and per-node/edge "summary").
+- Drop articles (the, a, an), filler words, throat-clearing phrases.
+- Use sentence fragments, not full sentences. Telegraphic OK.
+- Abbreviate where unambiguous. Keep technical specifics: ids, labels, methods, paths, numbers, host names.
+- DO NOT abbreviate or alter structured JSON shape: id, label, kind, ghost, confidence, sourceLogIds, resources, children must remain valid and exact. Field names exact.
+- Output remains strict JSON. No prose outside the JSON object.
+
+`;
+
+function buildSystemPrompt(base, caveman) {
+  return caveman ? (CAVEMAN_DIRECTIVE + base) : base;
+}
+
 function extractJsonObject(text) {
   if (!text) throw new Error('Empty response from Claude');
   // Find first '{'
@@ -586,7 +606,7 @@ export async function reverseEngineer({ state, logText, onProgress }) {
     onProgress && onProgress('awaiting');
     const resp = await callLLM({
       settings: state.settings,
-      system: SYSTEM_PROMPT,
+      system: buildSystemPrompt(SYSTEM_PROMPT, !!(state.settings && state.settings.caveman)),
       user,
       stream: true,
       onTextDelta: (delta) => {
@@ -665,7 +685,7 @@ ${userMessage}`;
     onProgress?.('awaiting');
     const data = await callLLM({
       settings: state.settings,
-      system: CHAT_SYSTEM_PROMPT,
+      system: buildSystemPrompt(CHAT_SYSTEM_PROMPT, !!(state.settings && state.settings.caveman)),
       user,
       maxTokens: 1024,
       asJson: false,

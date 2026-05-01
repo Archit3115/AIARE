@@ -54,6 +54,7 @@ const els = {
   baseUrlRow:    $('base-url-row'),
   modelSelect:   $('model-select'),
   modelCustom:   $('model-custom'),
+  cavemanToggle: $('caveman-toggle'),
   settingsCancel:$('settings-cancel'),
   settingsSave:  $('settings-save'),
 
@@ -455,6 +456,7 @@ function openSettings() {
   els.baseUrl.value = state.settings.baseUrl || '';
   els.baseUrlRow.style.display = (els.providerSelect.value === 'openai') ? '' : 'none';
   populateModelSelect(els.providerSelect.value, state.settings.model);
+  els.cavemanToggle.checked = !!state.settings.caveman;
   openModal(els.settingsModal);
 }
 function saveSettings() {
@@ -463,9 +465,10 @@ function saveSettings() {
   state.settings.apiKey   = els.apiKey.value.trim();
   state.settings.baseUrl  = els.baseUrl.value.trim();
   state.settings.model    = getSelectedModel() || PROVIDER_DEFAULT_MODEL[provider] || 'claude-sonnet-4-6';
+  state.settings.caveman  = !!els.cavemanToggle.checked;
   persist(state);
   closeModal(els.settingsModal);
-  pushSystem(`Settings saved — provider: ${state.settings.provider}, model: ${state.settings.model}.`);
+  pushSystem(`Settings saved — provider: ${state.settings.provider}, model: ${state.settings.model}${state.settings.caveman ? ', caveman mode ON' : ''}.`);
 }
 
 function openMerge() {

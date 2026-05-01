@@ -13,6 +13,9 @@ export const DEFAULT_SETTINGS = {
   apiKey: '',
   model: 'claude-sonnet-4-6',
   baseUrl: '',          // only used for OpenAI-compatible; '' means use api.openai.com/v1
+  caveman: false,       // when true, prepend a caveman-style brevity directive to the system
+                        // prompt (~65% fewer prose tokens; structured JSON kept exact).
+                        // Inspired by https://github.com/juliusbrussee/caveman (MIT).
 };
 
 /** Generate a stable id with optional prefix. */
@@ -39,6 +42,7 @@ export function loadAll() {
     apiKey:   s.apiKey   || DEFAULT_SETTINGS.apiKey,
     model:    s.model    || DEFAULT_SETTINGS.model,
     baseUrl:  s.baseUrl  || DEFAULT_SETTINGS.baseUrl,
+    caveman:  typeof s.caveman === 'boolean' ? s.caveman : DEFAULT_SETTINGS.caveman,
   };
 
   const state = { sessions, activeId, settings, drillPath: [], zoom: 1 };
