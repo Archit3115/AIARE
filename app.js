@@ -52,7 +52,8 @@ const els = {
   apiKey:        $('api-key'),
   baseUrl:       $('base-url'),
   baseUrlRow:    $('base-url-row'),
-  modelInput:    $('model-input'),
+  modelSelect:   $('model-select'),
+  modelCustom:   $('model-custom'),
   settingsCancel:$('settings-cancel'),
   settingsSave:  $('settings-save'),
 
@@ -396,27 +397,72 @@ async function handleFiles(fileList) {
 const openModal  = (m) => m.classList.add('open');
 const closeModal = (m) => m.classList.remove('open');
 
+const PROVIDER_MODELS = {
+  anthropic: ['claude-sonnet-4-6', 'claude-haiku-4-5-20251001', 'claude-opus-4-7'],
+  openai:    ['gpt-4o-mini', 'gpt-4o', 'gpt-4-turbo', 'o3-mini', 'llama-3.3-70b-versatile', 'mixtral-8x7b-32768', 'deepseek-chat', 'deepseek-reasoner', 'mistral-large-latest', 'qwen2.5-72b-instruct'],
+  gemini:    ['gemini-2.0-flash', 'gemini-2.5-pro', 'gemini-1.5-pro', 'gemini-1.5-flash'],
+};
+const PROVIDER_DEFAULT_MODEL = {
+  anthropic: 'claude-sonnet-4-6',
+  openai:    'gpt-4o-mini',
+  gemini:    'gemini-2.0-flash',
+};
+
+function populateModelSelect(provider, currentModel) {
+  els.modelSelect.innerHTML = '';
+  const opts = PROVIDER_MODELS[provider] || [];
+  for (const m of opts) {
+    const o = document.createElement('option');
+    o.value = m; o.textContent = m;
+    els.modelSelect.appendChild(o);
+  }
+  const customOpt = document.createElement('option');
+  customOpt.value = '__custom__';
+  customOpt.textContent = '— Custom (type below) —';
+  els.modelSelect.appendChild(customOpt);
+
+  if (currentModel && opts.includes(currentModel)) {
+    els.modelSelect.value = currentModel;
+    els.modelCustom.style.display = 'none';
+    els.modelCustom.value = '';
+  } else if (currentModel) {
+    els.modelSelect.value = '__custom__';
+    els.modelCustom.style.display = '';
+    els.modelCustom.value = currentModel;
+  } else {
+    els.modelSelect.value = opts[0] || '__custom__';
+    els.modelCustom.style.display = 'none';
+    els.modelCustom.value = '';
+  }
+}
+
+function getSelectedModel() {
+  if (els.modelSelect.value === '__custom__') return els.modelCustom.value.trim();
+  return els.modelSelect.value;
+}
+
 function syncSettingsModalForProvider() {
   const p = els.providerSelect.value;
   els.baseUrlRow.style.display = (p === 'openai') ? '' : 'none';
-  // Suggest a default model placeholder per provider
-  if (p === 'anthropic') els.modelInput.placeholder = 'claude-sonnet-4-6';
-  else if (p === 'openai') els.modelInput.placeholder = 'gpt-4o-mini (or any model your endpoint serves)';
-  else if (p === 'gemini') els.modelInput.placeholder = 'gemini-2.0-flash';
+  // When provider changes, default the model picker to that provider's default
+  // unless the user has typed something custom.
+  const cur = (p === state.settings.provider) ? state.settings.model : PROVIDER_DEFAULT_MODEL[p];
+  populateModelSelect(p, cur);
 }
 function openSettings() {
   els.providerSelect.value = state.settings.provider || 'anthropic';
   els.apiKey.value = state.settings.apiKey || '';
   els.baseUrl.value = state.settings.baseUrl || '';
-  els.modelInput.value = state.settings.model || '';
-  syncSettingsModalForProvider();
+  els.baseUrlRow.style.display = (els.providerSelect.value === 'openai') ? '' : 'none';
+  populateModelSelect(els.providerSelect.value, state.settings.model);
   openModal(els.settingsModal);
 }
 function saveSettings() {
-  state.settings.provider = els.providerSelect.value;
+  const provider = els.providerSelect.value;
+  state.settings.provider = provider;
   state.settings.apiKey   = els.apiKey.value.trim();
   state.settings.baseUrl  = els.baseUrl.value.trim();
-  state.settings.model    = els.modelInput.value.trim() || (state.settings.provider === 'gemini' ? 'gemini-2.0-flash' : state.settings.provider === 'openai' ? 'gpt-4o-mini' : 'claude-sonnet-4-6');
+  state.settings.model    = getSelectedModel() || PROVIDER_DEFAULT_MODEL[provider] || 'claude-sonnet-4-6';
   persist(state);
   closeModal(els.settingsModal);
   pushSystem(`Settings saved — provider: ${state.settings.provider}, model: ${state.settings.model}.`);
@@ -516,6 +562,10 @@ function init() {
   els.settingsCancel.addEventListener('click', () => closeModal(els.settingsModal));
   els.settingsSave.addEventListener('click', saveSettings);
   els.providerSelect.addEventListener('change', syncSettingsModalForProvider);
+  els.modelSelect.addEventListener('change', () => {
+    els.modelCustom.style.display = els.modelSelect.value === '__custom__' ? '' : 'none';
+    if (els.modelSelect.value === '__custom__') els.modelCustom.focus();
+  });
   els.mergeCancel.addEventListener('click', () => closeModal(els.mergeModal));
   els.mergeConfirm.addEventListener('click', () => {
     const id = els.mergeSelect.value;

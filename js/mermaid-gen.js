@@ -117,7 +117,8 @@ function buildTopLevel(model) {
     const toGhost = (nodeMap[e.to] && nodeMap[e.to].ghost) || e.ghost;
     const arrow = (fromGhost || toGhost || e.ghost) ? '-.->' : '-->';
     const proto = sanitizeLabel(e.protocol || '');
-    const lbl = proto ? `|${proto}|` : '';
+    // Wrap edge label in quotes so it tolerates parens, slashes, etc.
+    const lbl = proto ? `|"${proto}"|` : '';
     lines.push(`${sanitizeId(e.from)} ${arrow}${lbl} ${sanitizeId(e.to)}`);
   }
 
